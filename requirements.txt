@@ -1,0 +1,3 @@
+streamlit>=1.37
+snowflake-connector-python>=3.10
+cryptography>=42.0.0
