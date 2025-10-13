@@ -36,7 +36,7 @@ def get_conn():
 
     pk = load_private_key(key_path, key_pass)
     return snowflake.connector.connect(
-        account=account,
+        account=account,            # e.g. xy12345.us-east-1 (NOT the app.snowflake.com URL)
         user=user,
         role=role,
         warehouse=warehouse,
@@ -95,13 +95,41 @@ def nice_panel(title: str, content: str):
     with st.expander(title, expanded=False):
         st.code(content, language="sql")
 
+# ---- Extra helpers used by the environment-aware Migrate tab ----
+def _norm(s: str) -> str:
+    return (s or "").strip().upper()
+
+def db_exists_and_accessible(cur, db_name: str) -> Tuple[bool, bool]:
+    """
+    Returns (exists, accessible) for a database.
+      exists = DB is present in the account (or at least visible via SHOW)
+      accessible = current role can USE it (has USAGE privilege)
+    """
+    db_i = sql_ident(db_name)
+    try:
+        cur.execute(f"USE DATABASE {db_i}")
+        return True, True     # exists + you have USAGE
+    except Exception:
+        # Try to see if it exists (but you might not have USAGE)
+        try:
+            cur.execute(f"SHOW DATABASES LIKE '{_norm(db_name)}'")
+            rows = cur.fetchall()
+            if rows:
+                return True, False  # exists but no USAGE
+            return False, False     # probably doesn't exist (or not visible at all)
+        except Exception:
+            return False, False
+
+def xcenter_to_base(code: str, default_map: Dict[str, str]) -> str:
+    return default_map.get(code, code)
+
 # NEW: warehouse DDL builder
 def mk_warehouse_sql(name: str, opts: Dict[str, Any]) -> str:
     # Use IDENTIFIER to be safe with names (handles mixed/lowercase)
     ident = f"IDENTIFIER('\"{name}\"')"
 
     # Pull options with sane defaults
-    comment = (opts.get("comment", "") or "").replace("'", "''")  # correct escaping
+    comment = (opts.get("comment", "") or "").replace("'", "''")
     size = str(opts.get("size", "SMALL")).upper()
     auto_resume = "TRUE" if opts.get("auto_resume", True) else "FALSE"
     auto_suspend = int(opts.get("auto_suspend", 600))
@@ -134,7 +162,7 @@ with st.sidebar:
     st.session_state.user = st.text_input("Service user", value="CLI_USER", key="sb_user")
     st.session_state.role = st.text_input("Role to execute as", value="CLI_ROLE", key="sb_role")
     st.session_state.warehouse = st.text_input("Warehouse", value="WH_DATA_TEAM", key="sb_wh")
-    st.session_state.private_key_path = st.text_input("Private key path", value=r"C:\Users\rsuthrapu\.snowflake\keys\cli_user_key.p8", key="sb_pk_path")
+    st.session_state.private_key_path = st.text_input("Private key path", value=r"C:\\Users\\rsuthrapu\\.snowflake\\keys\\rsa_key.p8", key="sb_pk_path")
     st.session_state.private_key_passphrase = st.text_input("Key passphrase (if set)", type="password", key="sb_pk_pass")
 
 # Tabs in recommended order
@@ -272,6 +300,7 @@ with tab_env:
     admin_role  = st.text_input("Admin role",  value="AQS_APP_ADMIN",  key="env_admin_role")
     writer_role = st.text_input("Writer role", value="AQS_APP_WRITER", key="env_writer_role")
     reader_role = st.text_input("Reader role", value="AQS_APP_READER", key="env_reader_role")
+    auto_create_roles_env = st.checkbox("Auto-create these roles if missing", value=True, key="env_auto_roles")
     grant_db_privs_env = st.multiselect("DB privileges", ["USAGE", "MONITOR"], default=["USAGE", "MONITOR"], key="env_db_privs")
 
     st.divider()
@@ -303,6 +332,18 @@ with tab_env:
                 st.error("Select at least one xcenter.")
             else:
                 plan_env: List[str] = []
+
+                # Auto-create roles once per run (before any DB work)
+                if auto_create_roles_env:
+                    provisioning_role = (st.session_state.get("role") or "CLI_ROLE").upper()
+                    plan_env += [
+                        f"CREATE ROLE IF NOT EXISTS {sql_ident(admin_role)};",
+                        f"CREATE ROLE IF NOT EXISTS {sql_ident(writer_role)};",
+                        f"CREATE ROLE IF NOT EXISTS {sql_ident(reader_role)};",
+                        f"GRANT ROLE {sql_ident(admin_role)}  TO ROLE {sql_ident(provisioning_role)};",
+                        f"GRANT ROLE {sql_ident(writer_role)} TO ROLE {sql_ident(provisioning_role)};",
+                        f"GRANT ROLE {sql_ident(reader_role)} TO ROLE {sql_ident(provisioning_role)};",
+                    ]
 
                 for code, base in centers:
                     db_name = f"{base}_AQS_{env}".upper()
@@ -338,8 +379,7 @@ with tab_env:
                         wh_ident = f'IDENTIFIER(\'"{wh_name}"\')'
                         for r in wh_roles:
                             plan_env.append(f"GRANT USAGE ON WAREHOUSE {wh_ident} TO ROLE {sql_ident(r)};")
-                            # Optional MONITOR grant:
-                            # plan_env.append(f"GRANT MONITOR ON WAREHOUSE {wh_ident} TO ROLE {sql_ident(r)};")
+                            # plan_env.append(f"GRANT MONITOR ON WAREHOUSE {wh_ident} TO ROLE {sql_ident(r)};")  # optional
 
                 st.session_state.plan_env = plan_env
                 st.success(f"Built plan for {env} with xcenters: {', '.join([c for c, _ in centers])}")
@@ -536,116 +576,170 @@ with tab_cloud:
     )
 
 # -------------------------
-# Migrate Objects (CLONE)
+# Migrate Objects (CLONE) — Environment-aware
 # -------------------------
 with tab_migrate:
-    st.subheader("Migrate Objects from another DB/Schema (CLONE only)")
+    st.subheader("Migrate Objects (Environment-aware CLONE)")
 
-    colL, colR = st.columns(2)
-    with colL:
-        src_db = st.text_input("Source Database", value="SRC_DB", key="mig_src_db")
-        src_schema = st.text_input("Source Schema", value="ETL_CTRL", key="mig_src_schema")
-        tgt_db = st.text_input("Target Database", value="AQS_QA", key="mig_tgt_db")
-        tgt_schema = st.text_input("Target Schema", value="ETL_CTRL", key="mig_tgt_schema")
-    with colR:
-        do_tables = st.checkbox("Copy Tables (CLONE)", value=True, key="mig_do_tables")
-        do_views  = st.checkbox("Copy Views", value=True, key="mig_do_views")
-        do_procs  = st.checkbox("Copy Stored Procedures", value=True, key="mig_do_procs")
-        do_funcs  = st.checkbox("Copy Functions", value=False, key="mig_do_funcs")
-        auto_rewrite_execute = st.checkbox("Auto-rewrite & execute DDL for views/procs/funcs", value=True, key="mig_auto_rewrite")
-        drop_target_first = st.checkbox("Replace target schema (CREATE OR REPLACE SCHEMA ... CLONE ...)", value=False, key="mig_replace_schema")
+    # ------- Top controls -------
+    col_env, col_kind = st.columns([2, 3])
+    with col_env:
+        mig_env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="mig_env")
+    with col_kind:
+        st.caption("This builds DB names as <BASENAME>_AQS_<ENV>. Example: BILLING_AQS_DEV")
 
-    build = st.button("Build Migration Plan (CLONE)", key="mig_build_btn")
+    # Xcenters & basenames
+    st.markdown("**Choose xcenter and basenames**")
+    col_xc, col_base_bc, col_base_cc, col_base_pc = st.columns([1, 1, 1, 1])
+    with col_xc:
+        src_xc = st.selectbox("Source xcenter", ["BC", "CC", "PC"], index=0, key="mig_src_xc")
+        tgt_xc = st.selectbox("Target xcenter", ["BC", "CC", "PC"], index=1, key="mig_tgt_xc")
+    with col_base_bc:
+        base_bc = st.text_input("BC → DB basename", value="BILLING", key="mig_base_bc")
+    with col_base_cc:
+        base_cc = st.text_input("CC → DB basename", value="CLAIMS", key="mig_base_cc")
+    with col_base_pc:
+        base_pc = st.text_input("PC → DB basename", value="POLICY", key="mig_base_pc")
+
+    base_map = {"BC": base_bc, "CC": base_cc, "PC": base_pc}
+
+    # Schemas + object types
+    st.markdown("**Schemas & Object Types**")
+    col_src_sch, col_tgt_sch = st.columns(2)
+    with col_src_sch:
+        src_schema = st.text_input("Source schema", value="ETL_CTRL", key="mig_src_schema2")
+    with col_tgt_sch:
+        tgt_schema = st.text_input("Target schema", value="ETL_CTRL", key="mig_tgt_schema2")
+
+    col_types1, col_types2 = st.columns(2)
+    with col_types1:
+        do_tables = st.checkbox("Copy Tables (CLONE)", value=True, key="mig2_do_tables")
+        do_views  = st.checkbox("Copy Views", value=True, key="mig2_do_views")
+    with col_types2:
+        do_procs  = st.checkbox("Copy Stored Procedures", value=True, key="mig2_do_procs")
+        do_funcs  = st.checkbox("Copy Functions", value=False, key="mig2_do_funcs")
+
+    auto_rewrite_execute = st.checkbox("Auto-rewrite & execute DDL for views/procs/funcs", value=True, key="mig2_auto_rewrite")
+    drop_target_first    = st.checkbox("Replace target schema (CREATE OR REPLACE SCHEMA ... CLONE ...)", value=False, key="mig2_replace_schema")
+
+    # Compute DB names
+    src_db = f"{xcenter_to_base(src_xc, base_map)}_AQS_{mig_env}".upper()
+    tgt_db = f"{xcenter_to_base(tgt_xc, base_map)}_AQS_{mig_env}".upper()
+
+    st.info(f"Source DB: **{src_db}** | Target DB: **{tgt_db}**")
+
+    # Build plan button
+    build = st.button("Build Migration Plan (Environment-aware CLONE)", key="mig2_build_btn")
 
     if build:
-        # Identifiers for building DDL
-        sdb_i, ssc_i = sql_ident(src_db), sql_ident(src_schema)
-        tdb_i, tsc_i = sql_ident(tgt_db), sql_ident(tgt_schema)
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
 
-        # Uppercased string literals for information_schema filters
-        src_schema_lit = src_schema.upper()
-        plan_mig: List[str] = []
+                # ---- Preflight existence/privilege checks ----
+                src_exists, src_access = db_exists_and_accessible(cur, src_db)
+                tgt_exists, tgt_access = db_exists_and_accessible(cur, tgt_db)
 
-        if drop_target_first:
-            plan_mig.append(f"CREATE OR REPLACE SCHEMA {tdb_i}.{tsc_i} CLONE {sdb_i}.{ssc_i};")
-            st.session_state.plan_migrate = plan_mig
-            nice_panel("Migration Plan", "\n".join(plan_mig))
-        else:
-            # Build discovery SQL (using string literals for schema filter)
-            discover_cmds = []
-            if do_tables:
-                discover_cmds.append(
-                    f"SELECT 'TABLE' AS OBJ_TYPE, TABLE_NAME AS OBJ_NAME "
-                    f"FROM {sdb_i}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{src_schema_lit}';"
-                )
-            if do_views:
-                discover_cmds.append(
-                    f"SELECT 'VIEW' AS OBJ_TYPE, TABLE_NAME AS OBJ_NAME "
-                    f"FROM {sdb_i}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '{src_schema_lit}';"
-                )
-            if do_procs:
-                discover_cmds.append(
-                    f"SELECT 'PROC' AS OBJ_TYPE, "
-                    f"CONCAT(PROCEDURE_NAME,'(',COALESCE(ARGUMENT_SIGNATURE,''),')') AS OBJ_NAME "
-                    f"FROM {sdb_i}.INFORMATION_SCHEMA.PROCEDURES WHERE PROCEDURE_SCHEMA = '{src_schema_lit}';"
-                )
-            if do_funcs:
-                discover_cmds.append(
-                    f"SELECT 'FUNC' AS OBJ_TYPE, "
-                    f"CONCAT(FUNCTION_NAME,'(',COALESCE(ARGUMENT_SIGNATURE,''),')') AS OBJ_NAME "
-                    f"FROM {sdb_i}.INFORMATION_SCHEMA.FUNCTIONS WHERE FUNCTION_SCHEMA = '{src_schema_lit}';"
-                )
+                preflight_errors = []
+                if not src_exists:
+                    preflight_errors.append(f"❌ Source database **{src_db}** does not exist (or is not visible to your role).")
+                elif not src_access:
+                    preflight_errors.append(
+                        f"❌ Source database **{src_db}** exists but your role lacks USAGE.\n"
+                        f"   -> Ask an ACCOUNTADMIN (or DB owner) to run: `GRANT USAGE ON DATABASE {sql_ident(src_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};`"
+                    )
 
-            nice_panel("Discovery SQL (runs now)", "\n".join(discover_cmds))
+                if not tgt_exists:
+                    preflight_errors.append(f"❌ Target database **{tgt_db}** does not exist (or is not visible to your role).")
+                elif not tgt_access:
+                    preflight_errors.append(
+                        f"❌ Target database **{tgt_db}** exists but your role lacks USAGE.\n"
+                        f"   -> Ask to run: `GRANT USAGE ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};`"
+                    )
 
-            try:
-                with get_conn() as conn:
-                    cur = conn.cursor()
+                if preflight_errors:
+                    st.error("Preflight checks failed:\n\n" + "\n".join(preflight_errors))
+                else:
+                    # Build discovery SQL (against source info schema)
+                    sdb_i, ssc_i = sql_ident(src_db), sql_ident(src_schema)
+                    tdb_i, tsc_i = sql_ident(tgt_db), sql_ident(tgt_schema)
+                    src_schema_lit = src_schema.upper()
+                    plan_mig: List[str] = []
 
-                    objs: List[Dict[str, str]] = []
-                    # Collect objects in deterministic order: tables → views → procs → funcs
-                    for q in discover_cmds:
-                        cur.execute(q)
-                        rows = cur.fetchall()
-                        for r in rows:
-                            objs.append({"type": r[0], "name": r[1]})
+                    if drop_target_first:
+                        plan_mig.append(f"CREATE OR REPLACE SCHEMA {tdb_i}.{tsc_i} CLONE {sdb_i}.{ssc_i};")
+                        st.session_state.plan_migrate = plan_mig
+                        nice_panel("Migration Plan", "\n".join(plan_mig))
+                    else:
+                        discover_cmds = []
+                        if do_tables:
+                            discover_cmds.append(
+                                f"SELECT 'TABLE' AS OBJ_TYPE, TABLE_NAME AS OBJ_NAME "
+                                f"FROM {sdb_i}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{src_schema_lit}';"
+                            )
+                        if do_views:
+                            discover_cmds.append(
+                                f"SELECT 'VIEW' AS OBJ_TYPE, TABLE_NAME AS OBJ_NAME "
+                                f"FROM {sdb_i}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '{src_schema_lit}';"
+                            )
+                        if do_procs:
+                            discover_cmds.append(
+                                f"SELECT 'PROC' AS OBJ_TYPE, "
+                                f"CONCAT(PROCEDURE_NAME,'(',COALESCE(ARGUMENT_SIGNATURE,''),')') AS OBJ_NAME "
+                                f"FROM {sdb_i}.INFORMATION_SCHEMA.PROCEDURES WHERE PROCEDURE_SCHEMA = '{src_schema_lit}';"
+                            )
+                        if do_funcs:
+                            discover_cmds.append(
+                                f"SELECT 'FUNC' AS OBJ_TYPE, "
+                                f"CONCAT(FUNCTION_NAME,'(',COALESCE(ARGUMENT_SIGNATURE,''),')') AS OBJ_NAME "
+                                f"FROM {sdb_i}.INFORMATION_SCHEMA.FUNCTIONS WHERE FUNCTION_SCHEMA = '{src_schema_lit}';"
+                            )
 
-                    # Build clone/DDL plan
-                    for o in objs:
-                        typ, name = o["type"], o["name"]
-                        if typ == "TABLE":
-                            src_fqn = f"{sdb_i}.{ssc_i}.{sql_ident(name)}"
-                            tgt_fqn = f"{tdb_i}.{tsc_i}.{sql_ident(name)}"
-                            plan_mig.append(f"CREATE TABLE {tgt_fqn} CLONE {src_fqn};")
-                        elif typ in ("VIEW", "PROC", "FUNC"):
-                            obj_kind = {"VIEW": "VIEW", "PROC": "PROCEDURE", "FUNC": "FUNCTION"}[typ]
-                            src_obj_string = f"{src_db}.{src_schema}.{name}"
-                            cur.execute(f"SELECT GET_DDL('{obj_kind}','{src_obj_string}', TRUE)")
-                            ddl_text = cur.fetchone()[0]
+                        nice_panel("Discovery SQL (runs now)", "\n".join(discover_cmds))
 
-                            if auto_rewrite_execute:
-                                ddl_rewritten = ddl_text.replace(f"{src_db}.{src_schema}.", f"{tgt_db}.{tgt_schema}.") \
-                                                        .replace(f"{src_db}.{src_schema}", f"{tgt_db}.{tgt_schema}")
-                                plan_mig.append(ddl_rewritten.rstrip(";") + ";")
-                            else:
-                                plan_mig.append(f"-- REVIEW & RUN in target: {obj_kind} {name}")
-                                plan_mig.append(ddl_text.rstrip(";") + ";")
+                        objs: List[Dict[str, str]] = []
+                        for q in discover_cmds:
+                            cur.execute(q)
+                            rows = cur.fetchall()
+                            for r in rows:
+                                objs.append({"type": r[0], "name": r[1]})
 
-                    # Basic grants on target schema (optional)
-                    plan_mig.append(f"GRANT USAGE ON SCHEMA {tdb_i}.{tsc_i} TO ROLE AQS_APP_READER;")
-                    plan_mig.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tdb_i}.{tsc_i} TO ROLE AQS_APP_WRITER;")
-                    plan_mig.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tdb_i}.{tsc_i} TO ROLE AQS_APP_ADMIN;")
+                        # Build clone/DDL plan
+                        for o in objs:
+                            typ, name = o["type"], o["name"]
+                            if typ == "TABLE":
+                                src_fqn = f"{sdb_i}.{ssc_i}.{sql_ident(name)}"
+                                tgt_fqn = f"{tdb_i}.{tsc_i}.{sql_ident(name)}"
+                                plan_mig.append(f"CREATE TABLE {tgt_fqn} CLONE {src_fqn};")
+                            elif typ in ("VIEW", "PROC", "FUNC"):
+                                obj_kind = {"VIEW": "VIEW", "PROC": "PROCEDURE", "FUNC": "FUNCTION"}[typ]
+                                src_obj_string = f"{src_db}.{src_schema}.{name}"
+                                cur.execute(f"SELECT GET_DDL('{obj_kind}','{src_obj_string}', TRUE)")
+                                ddl_text = cur.fetchone()[0]
 
-                    st.session_state.plan_migrate = plan_mig
-                    st.success(f"Built migration plan for {src_db}.{src_schema} → {tgt_db}.{tgt_schema}")
-                    nice_panel("Migration Plan", "\n".join(plan_mig))
+                                if auto_rewrite_execute:
+                                    ddl_rewritten = ddl_text.replace(f"{src_db}.{src_schema}.", f"{tgt_db}.{tgt_schema}.") \
+                                                            .replace(f"{src_db}.{src_schema}", f"{tgt_db}.{tgt_schema}")
+                                    plan_mig.append(ddl_rewritten.rstrip(";") + ";")
+                                else:
+                                    plan_mig.append(f"-- REVIEW & RUN in target: {obj_kind} {name}")
+                                    plan_mig.append(ddl_text.rstrip(";") + ";")
 
-            except Exception as e:
-                st.error(f"Discovery failed: {e}")
+                        # Optional target grants
+                        plan_mig.append(f"GRANT USAGE ON SCHEMA {tdb_i}.{tsc_i} TO ROLE {sql_ident('AQS_APP_READER')};")
+                        plan_mig.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tdb_i}.{tsc_i} TO ROLE {sql_ident('AQS_APP_WRITER')};")
+                        plan_mig.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tdb_i}.{tsc_i} TO ROLE {sql_ident('AQS_APP_ADMIN')};")
+
+                        st.session_state.plan_migrate = plan_mig
+                        st.success(f"Built migration plan for {src_db}.{src_schema} → {tgt_db}.{tgt_schema}")
+                        nice_panel("Migration Plan", "\n".join(plan_mig))
+
+        except Exception as e:
+            st.error(f"Discovery failed: {e}")
 
     # Execute migration plan
     if st.session_state.get("plan_migrate"):
-        if st.button("Execute Migration Plan", type="primary", key="mig_exec_btn"):
+        if st.button("Execute Migration Plan", type="primary", key="mig2_exec_btn"):
             try:
                 with get_conn() as conn:
                     cur = conn.cursor()
