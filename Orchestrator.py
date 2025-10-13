@@ -95,40 +95,57 @@ def nice_panel(title: str, content: str):
     with st.expander(title, expanded=False):
         st.code(content, language="sql")
 
-# ---- Extra helpers used by the environment-aware Migrate tab ----
-def _norm(s: str) -> str:
+# ---- Extra helpers used by migration & seeding ----
+def _U(s: str) -> str:
     return (s or "").strip().upper()
 
-def db_exists_and_accessible(cur, db_name: str) -> Tuple[bool, bool]:
-    """
-    Returns (exists, accessible) for a database.
-      exists = DB is present in the account (or at least visible via SHOW)
-      accessible = current role can USE it (has USAGE privilege)
-    """
-    db_i = sql_ident(db_name)
+def db_exists(cur, db_name: str) -> bool:
     try:
-        cur.execute(f"USE DATABASE {db_i}")
-        return True, True     # exists + you have USAGE
+        cur.execute(f"SHOW DATABASES LIKE '{_U(db_name)}'")
+        return bool(cur.fetchall())
     except Exception:
-        # Try to see if it exists (but you might not have USAGE)
-        try:
-            cur.execute(f"SHOW DATABASES LIKE '{_norm(db_name)}'")
-            rows = cur.fetchall()
-            if rows:
-                return True, False  # exists but no USAGE
-            return False, False     # probably doesn't exist (or not visible at all)
-        except Exception:
-            return False, False
+        return False
+
+def schema_exists_via_info_schema(cur, db_name: str, schema: str) -> bool:
+    # Prefer INFORMATION_SCHEMA over SHOW; requires fewer privileges
+    if not db_exists(cur, db_name):
+        return False
+    try:
+        cur.execute(
+            f"SELECT 1 FROM {sql_ident(db_name)}.INFORMATION_SCHEMA.SCHEMATA "
+            f"WHERE SCHEMA_NAME='{_U(schema)}' LIMIT 1"
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+def can_read_schema_tables(cur, db_name: str, schema: str) -> bool:
+    # Probe: can we read tables list from the schema?
+    try:
+        cur.execute(
+            f"SELECT COUNT(*) FROM {sql_ident(db_name)}.INFORMATION_SCHEMA.TABLES "
+            f"WHERE TABLE_SCHEMA='{_U(schema)}'"
+        )
+        _ = cur.fetchone()
+        return True
+    except Exception:
+        return False
+
+def has_usage_on_db(cur, db_name: str) -> bool:
+    # Minimal proof of USAGE on DB: any read from INFORMATION_SCHEMA
+    try:
+        cur.execute(f"SELECT 1 FROM {sql_ident(db_name)}.INFORMATION_SCHEMA.SCHEMATA LIMIT 1")
+        _ = cur.fetchone()
+        return True
+    except Exception:
+        return False
 
 def xcenter_to_base(code: str, default_map: Dict[str, str]) -> str:
     return default_map.get(code, code)
 
 # NEW: warehouse DDL builder
 def mk_warehouse_sql(name: str, opts: Dict[str, Any]) -> str:
-    # Use IDENTIFIER to be safe with names (handles mixed/lowercase)
     ident = f"IDENTIFIER('\"{name}\"')"
-
-    # Pull options with sane defaults
     comment = (opts.get("comment", "") or "").replace("'", "''")
     size = str(opts.get("size", "SMALL")).upper()
     auto_resume = "TRUE" if opts.get("auto_resume", True) else "FALSE"
@@ -188,7 +205,6 @@ with tab_setup:
     col1, col2 = st.columns(2)
 
     with col1:
-        # Multiple DBs
         db_list_raw = st.text_input(
             "Databases (comma-separated)",
             value="BILLING_AQS_DEV, CLAIMS_AQS_DEV, POLICY_AQS_DEV",
@@ -196,7 +212,6 @@ with tab_setup:
         )
         schema_list_raw = st.text_input("Schemas (comma-separated)", value="STG, MRG, ETL_CTRL", key="setup_schema_list")
 
-        # Roles (same across DBs)
         st.markdown("**App Roles (recommended)**")
         auto_roles = st.checkbox("Create standard roles", value=True, key="setup_auto_roles")
         admin_role  = st.text_input("Admin role", value="AQS_APP_ADMIN", key="setup_admin_role")
@@ -232,7 +247,6 @@ with tab_setup:
         else:
             plan: List[str] = []
 
-            # Roles (once)
             if auto_roles:
                 executor_role = st.session_state.get("role", "CLI_ROLE")
                 plan += [
@@ -245,24 +259,20 @@ with tab_setup:
                 ]
 
             for db_name in dbs:
-                # DB + Schemas
                 plan.append(f"CREATE DATABASE IF NOT EXISTS {sql_ident(db_name)};")
                 for sc in schemas:
                     plan.append(f"CREATE SCHEMA IF NOT EXISTS {sql_ident(db_name)}.{sql_ident(sc)};")
 
-                # DB-level grants
                 for r in [reader_role, writer_role, admin_role]:
                     for p in grant_db_privs:
                         plan.append(f"GRANT {p} ON DATABASE {sql_ident(db_name)} TO ROLE {sql_ident(r)};")
 
-                # Schema-level grants
                 for sc in schemas:
                     di = f"{sql_ident(db_name)}.{sql_ident(sc)}"
                     plan.append(f"GRANT USAGE ON SCHEMA {di} TO ROLE {sql_ident(reader_role)};")
                     plan.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {di} TO ROLE {sql_ident(writer_role)};")
                     plan.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {di} TO ROLE {sql_ident(admin_role)};")
 
-            # Optional internal stage (first DB only to avoid duplicates)
             if stage_wanted and dbs:
                 plan += mk_stage_sql(dbs[0], stage_schema or "STG", stage_name, ff or "", dir_enable)
 
@@ -276,7 +286,6 @@ with tab_setup:
 with tab_env:
     st.subheader("Environment Builder (pick DEV/QA/STG and xcenters every time)")
 
-    # ---- Controls ----
     env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="env_env")
 
     st.markdown("**Xcenters to build now**")
@@ -333,7 +342,6 @@ with tab_env:
             else:
                 plan_env: List[str] = []
 
-                # Auto-create roles once per run (before any DB work)
                 if auto_create_roles_env:
                     provisioning_role = (st.session_state.get("role") or "CLI_ROLE").upper()
                     plan_env += [
@@ -379,7 +387,6 @@ with tab_env:
                         wh_ident = f'IDENTIFIER(\'"{wh_name}"\')'
                         for r in wh_roles:
                             plan_env.append(f"GRANT USAGE ON WAREHOUSE {wh_ident} TO ROLE {sql_ident(r)};")
-                            # plan_env.append(f"GRANT MONITOR ON WAREHOUSE {wh_ident} TO ROLE {sql_ident(r)};")  # optional
 
                 st.session_state.plan_env = plan_env
                 st.success(f"Built plan for {env} with xcenters: {', '.join([c for c, _ in centers])}")
@@ -405,7 +412,6 @@ with tab_env:
 with tab_warehouse:
     st.subheader("Create Warehouses")
 
-    # Names (comma-separated). Pre-fill with your three.
     wh_list_raw = st.text_input(
         "Warehouse names (comma-separated)",
         value="WH_DATA_ENGNR_SML_BC_AQS_DEV, WH_DATA_ENGNR_SML_CC_AQS_DEV, WH_DATA_ENGNR_SML_PC_AQS_DEV",
@@ -444,7 +450,6 @@ with tab_warehouse:
             )
             wh_plan = [mk_warehouse_sql(n, opts) for n in names]
 
-            # Optional grants
             grant_roles = [r.strip() for r in grant_roles_raw.split(",") if r.strip()]
             for n in names:
                 wh_ident = f'IDENTIFIER(\'"{n}"\')'
@@ -455,7 +460,6 @@ with tab_warehouse:
             st.success(f"Warehouse plan built for: {', '.join(names)}")
             nice_panel("Warehouse SQL Plan", "\n".join(wh_plan))
 
-    # Execute just the warehouse plan from this tab
     if st.session_state.get("plan_warehouse"):
         if st.button("Execute Warehouse Plan", type="primary", key="wh_exec_btn"):
             try:
@@ -476,7 +480,6 @@ with tab_warehouse:
 with tab_cloud:
     st.subheader("AWS / S3 Integration Helper (per environment, per xcenter)")
 
-    # ENV + pattern controls
     env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="cloud_env")
     env_lower = env.lower()
 
@@ -484,20 +487,17 @@ with tab_cloud:
     org_prefix = st.text_input("Org prefix", value="abc", key="cloud_org_prefix")
     mid_tokens = st.text_input("Middle tokens (between env and xcenter)", value="env-aqs-gw-landing-zone", key="cloud_mid_tokens")
     index_token = st.text_input("Index token", value="01", key="cloud_index_token")
-    bucket_suffix = "bucket"  # fixed per your examples
+    bucket_suffix = "bucket"
 
-    # Xcenters to include
     st.markdown("**Xcenters**")
     use_bc = st.checkbox("BC", value=True, key="cloud_bc")
     use_cc = st.checkbox("CC", value=True, key="cloud_cc")
     use_pc = st.checkbox("PC", value=True, key="cloud_pc")
     xcenters = [c for c, flag in [("bc", use_bc), ("cc", use_cc), ("pc", use_pc)] if flag]
 
-    # Auto-generate bucket names (editable)
     def mk_bucket(xc: str) -> str:
         return f"{org_prefix}-{env_lower}-{mid_tokens}-{xc}-{index_token}-{bucket_suffix}"
 
-    st.markdown("**Bucket names (auto-generated – you can override)**")
     colb1, colb2, colb3 = st.columns(3)
     with colb1:
         b_bc = st.text_input("BC bucket", value=mk_bucket("bc"), key="cloud_b_bc")
@@ -506,36 +506,24 @@ with tab_cloud:
     with colb3:
         b_pc = st.text_input("PC bucket", value=mk_bucket("pc"), key="cloud_b_pc")
 
-    # Target in Snowflake for the stages
     st.markdown("**Target in Snowflake**")
     target_db = st.text_input("Target Database", value=f"AQS_{env}", key="cloud_target_db")
     target_schema = st.text_input("Target Schema", value="STG", key="cloud_target_schema")
-
-    # Integration name per env
     integ_name = st.text_input("Storage Integration name", value=f"AQS_S3_INT_{env}", key="cloud_integ_name")
 
-    # Region + role info
-    st.markdown("**AWS / Snowflake trust**")
     aws_region = st.text_input("AWS region", value="us-east-1", key="cloud_region")
     role_arn = st.text_input("AWS IAM Role ARN (from Terraform output)", value="", key="cloud_role_arn")
     sf_aws_acct = st.text_input("Snowflake AWS Account ID (for your SF region)", value="", key="cloud_sf_aws_acct")
     st.caption("Tip: first run Terraform with external_id=TEMP, then after `DESC INTEGRATION` re-apply with the real ExternalId.")
 
-    # Build plan
     if st.button("Build Integration + Stages SQL", key="cloud_build_btn"):
         if not role_arn:
             st.error("Provide the AWS IAM Role ARN from Terraform output.")
         else:
-            # Collect allowed locations for selected xcenters only
-            buckets_map = {
-                "bc": b_bc,
-                "cc": b_cc,
-                "pc": b_pc
-            }
+            buckets_map = {"bc": b_bc, "cc": b_cc, "pc": b_pc}
             selected_buckets = [buckets_map[xc] for xc in xcenters]
             allowed = ",".join([f"'s3://{bn}/'" for bn in selected_buckets])
 
-            # Storage integration
             sqls = [
                 f"CREATE OR REPLACE STORAGE INTEGRATION {sql_ident(integ_name)} TYPE=EXTERNAL_STAGE STORAGE_PROVIDER='S3' ENABLED=TRUE "
                 f"STORAGE_AWS_ROLE_ARN='{role_arn}' "
@@ -543,7 +531,6 @@ with tab_cloud:
                 f"DESC INTEGRATION {sql_ident(integ_name)};"
             ]
 
-            # Stages (one per selected xcenter) in chosen DB/Schema
             stage_names = {"bc": "S3_LZ_BC", "cc": "S3_LZ_CC", "pc": "S3_LZ_PC"}
             for xc in xcenters:
                 bucket = buckets_map[xc]
@@ -557,7 +544,6 @@ with tab_cloud:
             st.success(f"Built Integration + {len(xcenters)} stage(s) for {env}. Review below.")
             nice_panel("Integration SQL Plan", "\n".join(st.session_state.plan_cloud))
 
-    # Terraform helper – shows values to pass
     st.markdown("**Terraform apply helper**")
     tf_bullets = []
     tf_bullets.append(f'-var="project_prefix={org_prefix}-{env_lower}"')
@@ -570,185 +556,165 @@ with tab_cloud:
         f"terraform -chdir=infra/aws apply \\\n  " + " \\\n  ".join(tf_bullets) + "\n",
         language="bash"
     )
-    st.info(
-        "Flow: 1) Apply Terraform with external_id=TEMP → 2) Run the SQL above and execute DESC INTEGRATION → "
-        "3) Copy ExternalId value → 4) Re-apply Terraform with that ExternalId."
-    )
+    st.info("Flow: 1) Apply Terraform with external_id=TEMP → 2) Run the SQL above and execute DESC INTEGRATION → 3) Copy ExternalId value → 4) Re-apply Terraform with that ExternalId.")
 
 # -------------------------
-# Migrate Objects (CLONE) — Environment-aware
+# ETL_CTRL Seeder (single-purpose, environment-aware)
 # -------------------------
 with tab_migrate:
-    st.subheader("Migrate Objects (Environment-aware CLONE)")
+    st.subheader("Seed ETL_CTRL into xcenter databases (by environment)")
 
-    # ------- Top controls -------
-    col_env, col_kind = st.columns([2, 3])
-    with col_env:
-        mig_env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="mig_env")
-    with col_kind:
-        st.caption("This builds DB names as <BASENAME>_AQS_<ENV>. Example: BILLING_AQS_DEV")
+    # ---- Settings ----
+    env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="seed_env")
+    src_db = st.text_input("Source database (has ETL_CTRL)", value="CLAIMS_STG", key="seed_src_db")
+    schema_name = "ETL_CTRL"  # fixed
 
-    # Xcenters & basenames
-    st.markdown("**Choose xcenter and basenames**")
-    col_xc, col_base_bc, col_base_cc, col_base_pc = st.columns([1, 1, 1, 1])
-    with col_xc:
-        src_xc = st.selectbox("Source xcenter", ["BC", "CC", "PC"], index=0, key="mig_src_xc")
-        tgt_xc = st.selectbox("Target xcenter", ["BC", "CC", "PC"], index=1, key="mig_tgt_xc")
-    with col_base_bc:
-        base_bc = st.text_input("BC → DB basename", value="BILLING", key="mig_base_bc")
-    with col_base_cc:
-        base_cc = st.text_input("CC → DB basename", value="CLAIMS", key="mig_base_cc")
-    with col_base_pc:
-        base_pc = st.text_input("PC → DB basename", value="POLICY", key="mig_base_pc")
+    st.markdown("**Targets (basenames + which xcenters to seed)**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        base_bc = st.text_input("BC → DB basename", value="BILLING", key="seed_base_bc")
+        do_bc   = st.checkbox("Seed BC", value=True, key="seed_do_bc")
+    with c2:
+        base_cc = st.text_input("CC → DB basename", value="CLAIMS", key="seed_base_cc")
+        do_cc   = st.checkbox("Seed CC", value=True, key="seed_do_cc")
+    with c3:
+        base_pc = st.text_input("PC → DB basename", value="POLICY", key="seed_base_pc")
+        do_pc   = st.checkbox("Seed PC", value=True, key="seed_do_pc")
 
-    base_map = {"BC": base_bc, "CC": base_cc, "PC": base_pc}
+    destructive   = st.checkbox("CREATE OR REPLACE ETL_CTRL in targets (destructive)", value=False, key="seed_replace")
+    apply_grants  = st.checkbox("Apply basic grants on target ETL_CTRL (AQS_APP_* roles)", value=True, key="seed_apply_grants")
 
-    # Schemas + object types
-    st.markdown("**Schemas & Object Types**")
-    col_src_sch, col_tgt_sch = st.columns(2)
-    with col_src_sch:
-        src_schema = st.text_input("Source schema", value="ETL_CTRL", key="mig_src_schema2")
-    with col_tgt_sch:
-        tgt_schema = st.text_input("Target schema", value="ETL_CTRL", key="mig_tgt_schema2")
+    # Compute target DBs (and show them)
+    targets = []
+    if do_bc: targets.append(("BC", f"{_U(base_bc)}_AQS_{_U(env)}"))
+    if do_cc: targets.append(("CC", f"{_U(base_cc)}_AQS_{_U(env)}"))
+    if do_pc: targets.append(("PC", f"{_U(base_pc)}_AQS_{_U(env)}"))
 
-    col_types1, col_types2 = st.columns(2)
-    with col_types1:
-        do_tables = st.checkbox("Copy Tables (CLONE)", value=True, key="mig2_do_tables")
-        do_views  = st.checkbox("Copy Views", value=True, key="mig2_do_views")
-    with col_types2:
-        do_procs  = st.checkbox("Copy Stored Procedures", value=True, key="mig2_do_procs")
-        do_funcs  = st.checkbox("Copy Functions", value=False, key="mig2_do_funcs")
+    if targets:
+        nice_panel("Targets to seed (computed)", "\n".join([f"- {label}: {db}" for label, db in targets]))
+    else:
+        st.info("No targets selected yet.")
 
-    auto_rewrite_execute = st.checkbox("Auto-rewrite & execute DDL for views/procs/funcs", value=True, key="mig2_auto_rewrite")
-    drop_target_first    = st.checkbox("Replace target schema (CREATE OR REPLACE SCHEMA ... CLONE ...)", value=False, key="mig2_replace_schema")
-
-    # Compute DB names
-    src_db = f"{xcenter_to_base(src_xc, base_map)}_AQS_{mig_env}".upper()
-    tgt_db = f"{xcenter_to_base(tgt_xc, base_map)}_AQS_{mig_env}".upper()
-
-    st.info(f"Source DB: **{src_db}** | Target DB: **{tgt_db}**")
-
-    # Build plan button
-    build = st.button("Build Migration Plan (Environment-aware CLONE)", key="mig2_build_btn")
-
-    if build:
+    # Build plan (discover first; then emit explicit SQL)
+    if st.button("Build ETL_CTRL Seeding Plan", key="seed_build_btn"):
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
 
-                # ---- Preflight existence/privilege checks ----
-                src_exists, src_access = db_exists_and_accessible(cur, src_db)
-                tgt_exists, tgt_access = db_exists_and_accessible(cur, tgt_db)
+                # ---- Source checks (favor INFORMATION_SCHEMA over SHOW) ----
+                src_exists  = db_exists(cur, src_db)
+                src_schema  = schema_exists_via_info_schema(cur, src_db, schema_name)
+                src_read_ok = can_read_schema_tables(cur, src_db, schema_name)  # probe
+                src_usage   = has_usage_on_db(cur, src_db)
 
-                preflight_errors = []
+                st.caption(
+                    f"🔎 Preflight debug · src_exists={src_exists} · src_schema={src_schema} · "
+                    f"can_read_src_schema={src_read_ok} · has_usage_on_db={src_usage}"
+                )
+
+                preflight = []
                 if not src_exists:
-                    preflight_errors.append(f"❌ Source database **{src_db}** does not exist (or is not visible to your role).")
-                elif not src_access:
-                    preflight_errors.append(
-                        f"❌ Source database **{src_db}** exists but your role lacks USAGE.\n"
-                        f"   -> Ask an ACCOUNTADMIN (or DB owner) to run: `GRANT USAGE ON DATABASE {sql_ident(src_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};`"
+                    preflight.append(f"❌ Database **{src_db}** does not exist (or not visible).")
+                # If we can *read* the schema via the probe, accept it even if the simple existence check is hidden.
+                if not (src_schema or src_read_ok):
+                    preflight.append(f"❌ Schema **{src_db}.{schema_name}** not found (or not visible).")
+                if not src_usage:
+                    preflight.append(
+                        "❌ Role likely lacks USAGE on source DB. Ensure:\n"
+                        f"  GRANT USAGE ON DATABASE {sql_ident(src_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};\n"
+                        f"  GRANT USAGE ON SCHEMA {sql_ident(src_db)}.{sql_ident(schema_name)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};"
                     )
 
-                if not tgt_exists:
-                    preflight_errors.append(f"❌ Target database **{tgt_db}** does not exist (or is not visible to your role).")
-                elif not tgt_access:
-                    preflight_errors.append(
-                        f"❌ Target database **{tgt_db}** exists but your role lacks USAGE.\n"
-                        f"   -> Ask to run: `GRANT USAGE ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};`"
-                    )
+                # ---- Targets preflight ----
+                for _, tgt_db in targets:
+                    if not db_exists(cur, tgt_db):
+                        preflight.append(f"ℹ️ Target DB **{tgt_db}** does not exist yet (will be created).")
+                    elif not has_usage_on_db(cur, tgt_db):
+                        preflight.append(
+                            f"❌ No USAGE on target DB **{tgt_db}**. Grant at least:\n"
+                            f"  GRANT USAGE ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};\n"
+                            f"  GRANT CREATE SCHEMA ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};"
+                        )
 
-                if preflight_errors:
-                    st.error("Preflight checks failed:\n\n" + "\n".join(preflight_errors))
-                else:
-                    # Build discovery SQL (against source info schema)
-                    sdb_i, ssc_i = sql_ident(src_db), sql_ident(src_schema)
-                    tdb_i, tsc_i = sql_ident(tgt_db), sql_ident(tgt_schema)
-                    src_schema_lit = src_schema.upper()
-                    plan_mig: List[str] = []
+                if preflight:
+                    nice_panel("Preflight report", "\n".join(preflight))
 
-                    if drop_target_first:
-                        plan_mig.append(f"CREATE OR REPLACE SCHEMA {tdb_i}.{tsc_i} CLONE {sdb_i}.{ssc_i};")
-                        st.session_state.plan_migrate = plan_mig
-                        nice_panel("Migration Plan", "\n".join(plan_mig))
+                # Stop only if the DB is missing OR neither schema check passes
+                if (not src_exists) or (not (src_schema or src_read_ok)):
+                    st.error(f"Preflight failed. Fix the items above (especially visibility/USAGE on {src_db}.{schema_name}) and rebuild.")
+                    st.stop()
+
+                # ---- Discover source objects (tables + views) ----
+                cur.execute(
+                    f"SELECT TABLE_NAME FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.TABLES "
+                    f"WHERE TABLE_SCHEMA='{_U(schema_name)}' ORDER BY TABLE_NAME"
+                )
+                src_tables = [r[0] for r in cur.fetchall()]
+
+                cur.execute(
+                    f"SELECT TABLE_NAME FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.VIEWS "
+                    f"WHERE TABLE_SCHEMA='{_U(schema_name)}' ORDER BY TABLE_NAME"
+                )
+                src_views = [r[0] for r in cur.fetchall()]
+
+                # ---- Build plan: explicit statements (no scripting placeholders) ----
+                plan_seed: List[str] = []
+                src_schema_qual = f"{sql_ident(src_db)}.{sql_ident(schema_name)}"
+
+                for _, tgt_db in targets:
+                    tgt_schema_qual = f"{sql_ident(tgt_db)}.{sql_ident(schema_name)}"
+
+                    # Create target db/schema
+                    plan_seed.append(f"CREATE DATABASE IF NOT EXISTS {sql_ident(tgt_db)};")
+                    if destructive:
+                        plan_seed.append(f"CREATE OR REPLACE SCHEMA {tgt_schema_qual} CLONE {src_schema_qual};")
                     else:
-                        discover_cmds = []
-                        if do_tables:
-                            discover_cmds.append(
-                                f"SELECT 'TABLE' AS OBJ_TYPE, TABLE_NAME AS OBJ_NAME "
-                                f"FROM {sdb_i}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{src_schema_lit}';"
+                        plan_seed.append(f"CREATE SCHEMA IF NOT EXISTS {tgt_schema_qual};")
+                        # Tables: per-object CLONE
+                        for t in src_tables:
+                            plan_seed.append(
+                                f"CREATE OR REPLACE TABLE {tgt_schema_qual}.{sql_ident(t)} "
+                                f"CLONE {src_schema_qual}.{sql_ident(t)};"
                             )
-                        if do_views:
-                            discover_cmds.append(
-                                f"SELECT 'VIEW' AS OBJ_TYPE, TABLE_NAME AS OBJ_NAME "
-                                f"FROM {sdb_i}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = '{src_schema_lit}';"
+                        # Views: fetch DDL, rewrite, append
+                        for v in src_views:
+                            cur.execute(
+                                f"SELECT GET_DDL('VIEW','{_U(src_db)}.{_U(schema_name)}.{_U(v)}', TRUE)"
                             )
-                        if do_procs:
-                            discover_cmds.append(
-                                f"SELECT 'PROC' AS OBJ_TYPE, "
-                                f"CONCAT(PROCEDURE_NAME,'(',COALESCE(ARGUMENT_SIGNATURE,''),')') AS OBJ_NAME "
-                                f"FROM {sdb_i}.INFORMATION_SCHEMA.PROCEDURES WHERE PROCEDURE_SCHEMA = '{src_schema_lit}';"
+                            ddl = cur.fetchone()[0]
+                            ddl_rewritten = (
+                                ddl
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
                             )
-                        if do_funcs:
-                            discover_cmds.append(
-                                f"SELECT 'FUNC' AS OBJ_TYPE, "
-                                f"CONCAT(FUNCTION_NAME,'(',COALESCE(ARGUMENT_SIGNATURE,''),')') AS OBJ_NAME "
-                                f"FROM {sdb_i}.INFORMATION_SCHEMA.FUNCTIONS WHERE FUNCTION_SCHEMA = '{src_schema_lit}';"
-                            )
+                            ddl_rewritten = ddl_rewritten.replace("CREATE VIEW", "CREATE OR REPLACE VIEW")
+                            plan_seed.append(ddl_rewritten.rstrip(";") + ";")
 
-                        nice_panel("Discovery SQL (runs now)", "\n".join(discover_cmds))
+                    if apply_grants:
+                        plan_seed += [
+                            f"GRANT USAGE ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_READER')};",
+                            f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_WRITER')};",
+                            f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_ADMIN')};",
+                        ]
 
-                        objs: List[Dict[str, str]] = []
-                        for q in discover_cmds:
-                            cur.execute(q)
-                            rows = cur.fetchall()
-                            for r in rows:
-                                objs.append({"type": r[0], "name": r[1]})
-
-                        # Build clone/DDL plan
-                        for o in objs:
-                            typ, name = o["type"], o["name"]
-                            if typ == "TABLE":
-                                src_fqn = f"{sdb_i}.{ssc_i}.{sql_ident(name)}"
-                                tgt_fqn = f"{tdb_i}.{tsc_i}.{sql_ident(name)}"
-                                plan_mig.append(f"CREATE TABLE {tgt_fqn} CLONE {src_fqn};")
-                            elif typ in ("VIEW", "PROC", "FUNC"):
-                                obj_kind = {"VIEW": "VIEW", "PROC": "PROCEDURE", "FUNC": "FUNCTION"}[typ]
-                                src_obj_string = f"{src_db}.{src_schema}.{name}"
-                                cur.execute(f"SELECT GET_DDL('{obj_kind}','{src_obj_string}', TRUE)")
-                                ddl_text = cur.fetchone()[0]
-
-                                if auto_rewrite_execute:
-                                    ddl_rewritten = ddl_text.replace(f"{src_db}.{src_schema}.", f"{tgt_db}.{tgt_schema}.") \
-                                                            .replace(f"{src_db}.{src_schema}", f"{tgt_db}.{tgt_schema}")
-                                    plan_mig.append(ddl_rewritten.rstrip(";") + ";")
-                                else:
-                                    plan_mig.append(f"-- REVIEW & RUN in target: {obj_kind} {name}")
-                                    plan_mig.append(ddl_text.rstrip(";") + ";")
-
-                        # Optional target grants
-                        plan_mig.append(f"GRANT USAGE ON SCHEMA {tdb_i}.{tsc_i} TO ROLE {sql_ident('AQS_APP_READER')};")
-                        plan_mig.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tdb_i}.{tsc_i} TO ROLE {sql_ident('AQS_APP_WRITER')};")
-                        plan_mig.append(f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tdb_i}.{tsc_i} TO ROLE {sql_ident('AQS_APP_ADMIN')};")
-
-                        st.session_state.plan_migrate = plan_mig
-                        st.success(f"Built migration plan for {src_db}.{src_schema} → {tgt_db}.{tgt_schema}")
-                        nice_panel("Migration Plan", "\n".join(plan_mig))
-
+                st.session_state.plan_seed = plan_seed
+                nice_panel("ETL_CTRL Seeding Plan (resolved)", "\n".join(plan_seed))
+                st.success("Seeding plan built. Review and Execute.")
         except Exception as e:
-            st.error(f"Discovery failed: {e}")
+            st.error(f"Seeding plan build failed: {e}")
 
-    # Execute migration plan
-    if st.session_state.get("plan_migrate"):
-        if st.button("Execute Migration Plan", type="primary", key="mig2_exec_btn"):
+    # Execute
+    if st.session_state.get("plan_seed"):
+        if st.button("Execute ETL_CTRL Seeding Plan", type="primary", key="seed_exec_btn"):
             try:
                 with get_conn() as conn:
                     cur = conn.cursor()
-                    success, failures = run_multi_sql(cur, st.session_state.plan_migrate)
+                    success, failures = run_multi_sql(cur, st.session_state.plan_seed)
                 st.session_state.audit = {"success": success, "failures": failures}
                 if failures:
                     st.error(f"Completed with errors. Rolled back. First error: {failures[0][1]}")
                 else:
-                    st.success("Migration executed successfully.")
+                    st.success("ETL_CTRL seeded successfully into selected xcenters.")
             except Exception as e:
                 st.error(f"Execution failed: {e}")
 
@@ -811,10 +777,7 @@ with tab_delete:
     st.subheader("Danger Zone: Delete Environment (ENV + Xcenters)")
     st.caption("Build a DROP plan based on DEV/QA and selected xcenters. Review carefully before executing.")
 
-    # Global safety: dry-run toggle
     del_dry_run = st.checkbox("Dry-run (preview only — do not execute)", value=True, key="del_dry_run")
-
-    # Environment + xcenters
     env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="del_env")
     env_upper = env.upper()
 
@@ -826,7 +789,6 @@ with tab_delete:
 
     st.divider()
 
-    # Names & patterns
     st.markdown("**Base DB names (editable)**")
     coln1, coln2, coln3 = st.columns(3)
     with coln1:
@@ -852,7 +814,6 @@ with tab_delete:
     st.markdown("**Warehouses**")
     drop_wh = st.checkbox("Drop warehouses for selected xcenters", value=True, key="del_drop_wh")
 
-    # Strong confirmation
     confirm_text = st.text_input("Type the environment name to confirm (DEV, QA, or STG)", key="del_confirm_text")
 
     if st.button("Build DROP Plan", key="del_build_btn"):
@@ -860,31 +821,24 @@ with tab_delete:
             st.error("Select at least one xcenter.")
         else:
             plan_drop: List[str] = []
-
-            # 1) Drop S3 stages for selected xcenters
             for c in centers:
                 stg = stage_names[c]
                 plan_drop.append(
                     f"DROP STAGE IF EXISTS {sql_ident(del_db_for_stages)}.{sql_ident(del_stage_schema)}.{sql_ident(stg)};"
                 )
-
-            # 2) Drop integration (optional)
             if drop_integration and integ_name.strip():
                 plan_drop.append(f"DROP INTEGRATION IF EXISTS {sql_ident(integ_name.strip())};")
 
-            # 3) Drop databases derived from basenames per xcenter
             base_map = {"BC": base_bc, "CC": base_cc, "PC": base_pc}
             for c in centers:
                 db_name = f"{base_map[c]}_AQS_{env_upper}".upper()
                 plan_drop.append(f"DROP DATABASE IF EXISTS {sql_ident(db_name)};")
 
-            # 4) Drop warehouses derived from xcenters (optional)
             if drop_wh:
                 for c in centers:
                     wh_ident = f'IDENTIFIER(\'"WH_DATA_ENGNR_SML_{c}_AQS_{env_upper}"\')'
                     plan_drop.append(f"DROP WAREHOUSE IF EXISTS {wh_ident};")
 
-            # 5) Drop roles (optional)
             if drop_roles:
                 for r in [x.strip() for x in roles_raw.split(",") if x.strip()]:
                     plan_drop.append(f"DROP ROLE IF EXISTS {sql_ident(r)};")
@@ -892,22 +846,15 @@ with tab_delete:
             st.session_state.plan_drop = plan_drop
             nice_panel("DROP Plan", "\n".join(plan_drop))
 
-            # final guardrail
             if confirm_text.strip().upper() != env_upper:
                 st.warning(f"Type **{env_upper}** in the confirmation box to enable execution.")
-
             if del_dry_run:
                 st.info("Dry-run is ON: execution is disabled. Review the plan above.")
             else:
                 st.success("Dry-run is OFF. You can execute the DROP plan below once confirmation matches.")
 
-    # Execute
     if st.session_state.get("plan_drop"):
-        can_execute = (
-            confirm_text.strip().upper() == env_upper
-            and not del_dry_run
-        )
-
+        can_execute = confirm_text.strip().upper() == env_upper and not del_dry_run
         if can_execute:
             if st.button("Execute DROP Plan (Irreversible)", type="primary", key="del_exec_btn"):
                 try:
