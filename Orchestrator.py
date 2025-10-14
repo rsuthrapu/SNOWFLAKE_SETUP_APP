@@ -6,6 +6,7 @@ import snowflake.connector
 from cryptography.hazmat.primitives import serialization as ser
 from cryptography.hazmat.backends import default_backend
 import pathlib
+import re
 
 st.set_page_config(page_title="Snowflake Setup Assistant", page_icon="❄️", layout="wide")
 
@@ -36,7 +37,7 @@ def get_conn():
 
     pk = load_private_key(key_path, key_pass)
     return snowflake.connector.connect(
-        account=account,            # e.g. xy12345.us-east-1 (NOT the app.snowflake.com URL)
+        account=account,            # e.g. xy12345.us-east-1
         user=user,
         role=role,
         warehouse=warehouse,
@@ -57,29 +58,21 @@ def sql_ident(name: str) -> str:
     return f'"{name}"'
 
 def run_multi_sql(cursor, stmts: List[str]) -> Tuple[List[Tuple[str, Optional[str]]], List[Tuple[str, str]]]:
+    """Execute statements sequentially (no explicit transaction). DDL auto-commits in Snowflake."""
     successes, failures = [], []
-    try:
-        cursor.execute("BEGIN")
-        for s in stmts:
-            sql = s.strip()
-            if not sql:
-                continue
-            try:
-                cursor.execute(sql)
-                try:
-                    info = json.dumps(cursor.fetchone()) if cursor.sfqid else "OK"
-                except Exception:
-                    info = "OK"
-                successes.append((sql, info))
-            except Exception as e:
-                failures.append((sql, str(e)))
-                raise
-        cursor.execute("COMMIT")
-    except Exception:
+    for s in stmts:
+        sql = s.strip()
+        if not sql:
+            continue
         try:
-            cursor.execute("ROLLBACK")
-        except Exception:
-            pass
+            cursor.execute(sql)
+            try:
+                info = json.dumps(cursor.fetchone()) if cursor.sfqid else "OK"
+            except Exception:
+                info = "OK"
+            successes.append((sql, info))
+        except Exception as e:
+            failures.append((sql, str(e)))
     return successes, failures
 
 def mk_stage_sql(db: str, schema: str, stage: str, file_format: str, directory: bool) -> List[str]:
@@ -95,7 +88,7 @@ def nice_panel(title: str, content: str):
     with st.expander(title, expanded=False):
         st.code(content, language="sql")
 
-# ---- Extra helpers used by migration & seeding ----
+# ---- Lookup helpers ----
 def _U(s: str) -> str:
     return (s or "").strip().upper()
 
@@ -107,7 +100,6 @@ def db_exists(cur, db_name: str) -> bool:
         return False
 
 def schema_exists_via_info_schema(cur, db_name: str, schema: str) -> bool:
-    # Prefer INFORMATION_SCHEMA over SHOW; requires fewer privileges
     if not db_exists(cur, db_name):
         return False
     try:
@@ -120,7 +112,6 @@ def schema_exists_via_info_schema(cur, db_name: str, schema: str) -> bool:
         return False
 
 def can_read_schema_tables(cur, db_name: str, schema: str) -> bool:
-    # Probe: can we read tables list from the schema?
     try:
         cur.execute(
             f"SELECT COUNT(*) FROM {sql_ident(db_name)}.INFORMATION_SCHEMA.TABLES "
@@ -132,7 +123,6 @@ def can_read_schema_tables(cur, db_name: str, schema: str) -> bool:
         return False
 
 def has_usage_on_db(cur, db_name: str) -> bool:
-    # Minimal proof of USAGE on DB: any read from INFORMATION_SCHEMA
     try:
         cur.execute(f"SELECT 1 FROM {sql_ident(db_name)}.INFORMATION_SCHEMA.SCHEMATA LIMIT 1")
         _ = cur.fetchone()
@@ -140,10 +130,6 @@ def has_usage_on_db(cur, db_name: str) -> bool:
     except Exception:
         return False
 
-def xcenter_to_base(code: str, default_map: Dict[str, str]) -> str:
-    return default_map.get(code, code)
-
-# NEW: warehouse DDL builder
 def mk_warehouse_sql(name: str, opts: Dict[str, Any]) -> str:
     ident = f"IDENTIFIER('\"{name}\"')"
     comment = (opts.get("comment", "") or "").replace("'", "''")
@@ -182,7 +168,7 @@ with st.sidebar:
     st.session_state.private_key_path = st.text_input("Private key path", value=r"C:\\Users\\rsuthrapu\\.snowflake\\keys\\rsa_key.p8", key="sb_pk_path")
     st.session_state.private_key_passphrase = st.text_input("Key passphrase (if set)", type="password", key="sb_pk_pass")
 
-# Tabs in recommended order
+# Tabs
 tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_preview_exec, tab_audit, tab_delete = st.tabs(
     [
         "Setup Plan",
@@ -203,13 +189,10 @@ with tab_setup:
     st.subheader("Objects to Create")
 
     col1, col2 = st.columns(2)
-
     with col1:
-        db_list_raw = st.text_input(
-            "Databases (comma-separated)",
-            value="BILLING_AQS_DEV, CLAIMS_AQS_DEV, POLICY_AQS_DEV",
-            key="setup_db_list"
-        )
+        db_list_raw = st.text_input("Databases (comma-separated)",
+                                    value="BILLING_AQS_DEV, CLAIMS_AQS_DEV, POLICY_AQS_DEV",
+                                    key="setup_db_list")
         schema_list_raw = st.text_input("Schemas (comma-separated)", value="STG, MRG, ETL_CTRL", key="setup_schema_list")
 
         st.markdown("**App Roles (recommended)**")
@@ -219,12 +202,7 @@ with tab_setup:
         reader_role = st.text_input("Reader role", value="AQS_APP_READER", key="setup_reader_role")
 
         st.markdown("**DB Grants to roles**")
-        grant_db_privs = st.multiselect(
-            "Database privileges",
-            ["USAGE", "MONITOR"],
-            default=["USAGE", "MONITOR"],
-            key="setup_db_privs"
-        )
+        grant_db_privs = st.multiselect("Database privileges", ["USAGE", "MONITOR"], default=["USAGE", "MONITOR"], key="setup_db_privs")
 
     with col2:
         st.markdown("**Optional Stage (created only in the first DB)**")
@@ -400,7 +378,7 @@ with tab_env:
                     success, failures = run_multi_sql(cur, st.session_state.plan_env)
                 st.session_state.audit = {"success": success, "failures": failures}
                 if failures:
-                    st.error(f"Completed with errors. Rolled back. First error: {failures[0][1]}")
+                    st.warning("Completed with errors. Note: DDL is auto-committed in Snowflake; some objects may already exist.")
                 else:
                     st.success("Environment created successfully.")
             except Exception as e:
@@ -468,7 +446,7 @@ with tab_warehouse:
                     success, failures = run_multi_sql(cur, st.session_state.plan_warehouse)
                 st.session_state.audit = {"success": success, "failures": failures}
                 if failures:
-                    st.error(f"Completed with errors. Rolled back. First error: {failures[0][1]}")
+                    st.warning("Completed with errors. Note: DDL is auto-committed in Snowflake; some objects may already exist.")
                 else:
                     st.success("Warehouses created and grants applied.")
             except Exception as e:
@@ -559,7 +537,7 @@ with tab_cloud:
     st.info("Flow: 1) Apply Terraform with external_id=TEMP → 2) Run the SQL above and execute DESC INTEGRATION → 3) Copy ExternalId value → 4) Re-apply Terraform with that ExternalId.")
 
 # -------------------------
-# ETL_CTRL Seeder (single-purpose, environment-aware)
+# ETL_CTRL Seeder (environment-aware, with procedure fallback)
 # -------------------------
 with tab_migrate:
     st.subheader("Seed ETL_CTRL into xcenter databases (by environment)")
@@ -567,7 +545,7 @@ with tab_migrate:
     # ---- Settings ----
     env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="seed_env")
     src_db = st.text_input("Source database (has ETL_CTRL)", value="CLAIMS_STG", key="seed_src_db")
-    schema_name = "ETL_CTRL"  # fixed
+    schema_name = "ETL_CTRL"
 
     st.markdown("**Targets (basenames + which xcenters to seed)**")
     c1, c2, c3 = st.columns(3)
@@ -584,7 +562,7 @@ with tab_migrate:
     destructive   = st.checkbox("CREATE OR REPLACE ETL_CTRL in targets (destructive)", value=False, key="seed_replace")
     apply_grants  = st.checkbox("Apply basic grants on target ETL_CTRL (AQS_APP_* roles)", value=True, key="seed_apply_grants")
 
-    # Compute target DBs (and show them)
+    # Compute targets
     targets = []
     if do_bc: targets.append(("BC", f"{_U(base_bc)}_AQS_{_U(env)}"))
     if do_cc: targets.append(("CC", f"{_U(base_cc)}_AQS_{_U(env)}"))
@@ -595,16 +573,85 @@ with tab_migrate:
     else:
         st.info("No targets selected yet.")
 
-    # Build plan (discover first; then emit explicit SQL)
+    # ---- Signature normalization helpers for procedures ----
+    def _normalize_proc_sig(sig: str) -> str:
+        """
+        Convert '(PARAM TYPE, PARAM2 TYPE2(10,2))' -> '(TYPE, TYPE2(10,2))'.
+        Accepts already-typed only sigs and returns them unchanged.
+        """
+        s = (sig or "").strip()
+        if not s.startswith("(") or not s.endswith(")"):
+            return "()"
+        inner = s[1:-1].strip()
+        if not inner:
+            return "()"
+        parts = []
+        # split on commas not inside parentheses
+        depth = 0
+        start = 0
+        for i, ch in enumerate(inner):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif ch == ',' and depth == 0:
+                parts.append(inner[start:i].strip())
+                start = i + 1
+        parts.append(inner[start:].strip())
+        types_only = []
+        for p in parts:
+            # If there's a space, treat the first token as name, rest as type
+            # e.g. 'LOAD_DETAILS OBJECT', '"MY ARG" NUMBER(38,0)'
+            if ' ' in p:
+                # remove repeated spaces
+                name_type = re.sub(r'\s+', ' ', p)
+                # split once (name, type_spec)
+                _, type_spec = name_type.split(' ', 1)
+                types_only.append(type_spec.strip())
+            else:
+                # Already a bare type
+                types_only.append(p)
+        return "(" + ", ".join(types_only) + ")"
+
+    def _show_proc_signatures(cur, db: str, schema: str, name: str) -> List[str]:
+        """
+        Returns a list of candidate signatures (types-only) for a procedure name
+        using SHOW PROCEDURES IN SCHEMA.
+        """
+        try:
+            cur.execute(f"SHOW PROCEDURES LIKE '{_U(name)}' IN SCHEMA {sql_ident(db)}.{sql_ident(schema)}")
+            cur.execute("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))")
+            sigs = []
+            for row in cur.fetchall():
+                # columns (indexes): 1=name, 6=arguments (types with/without names)
+                # empirically: name match is row[1]; arguments in row[6]
+                proc_name = row[1]
+                args = row[6] or ""
+                if _U(proc_name) != _U(name):
+                    continue
+                # args comes as 'VARCHAR, OBJECT' or 'P1 VARCHAR, P2 NUMBER(38,0)' or empty ''
+                args_sig = f"({args})" if args is not None else "()"
+                sigs.append(_normalize_proc_sig(args_sig))
+            # unique preserving order
+            seen = set()
+            uniq = []
+            for s in sigs:
+                if s not in seen:
+                    seen.add(s)
+                    uniq.append(s)
+            return uniq
+        except Exception:
+            return []
+
     if st.button("Build ETL_CTRL Seeding Plan", key="seed_build_btn"):
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
 
-                # ---- Source checks (favor INFORMATION_SCHEMA over SHOW) ----
+                # ---- Source checks ----
                 src_exists  = db_exists(cur, src_db)
                 src_schema  = schema_exists_via_info_schema(cur, src_db, schema_name)
-                src_read_ok = can_read_schema_tables(cur, src_db, schema_name)  # probe
+                src_read_ok = can_read_schema_tables(cur, src_db, schema_name)
                 src_usage   = has_usage_on_db(cur, src_db)
 
                 st.caption(
@@ -615,17 +662,16 @@ with tab_migrate:
                 preflight = []
                 if not src_exists:
                     preflight.append(f"❌ Database **{src_db}** does not exist (or not visible).")
-                # If we can *read* the schema via the probe, accept it even if the simple existence check is hidden.
                 if not (src_schema or src_read_ok):
                     preflight.append(f"❌ Schema **{src_db}.{schema_name}** not found (or not visible).")
                 if not src_usage:
                     preflight.append(
-                        "❌ Role likely lacks USAGE on source DB. Ensure:\n"
+                        "❌ Role likely lacks USAGE on source. Ensure:\n"
                         f"  GRANT USAGE ON DATABASE {sql_ident(src_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};\n"
                         f"  GRANT USAGE ON SCHEMA {sql_ident(src_db)}.{sql_ident(schema_name)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};"
                     )
 
-                # ---- Targets preflight ----
+                # Targets preflight
                 for _, tgt_db in targets:
                     if not db_exists(cur, tgt_db):
                         preflight.append(f"ℹ️ Target DB **{tgt_db}** does not exist yet (will be created).")
@@ -635,60 +681,210 @@ with tab_migrate:
                             f"  GRANT USAGE ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};\n"
                             f"  GRANT CREATE SCHEMA ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};"
                         )
-
                 if preflight:
                     nice_panel("Preflight report", "\n".join(preflight))
-
-                # Stop only if the DB is missing OR neither schema check passes
                 if (not src_exists) or (not (src_schema or src_read_ok)):
                     st.error(f"Preflight failed. Fix the items above (especially visibility/USAGE on {src_db}.{schema_name}) and rebuild.")
                     st.stop()
 
-                # ---- Discover source objects (tables + views) ----
+                # ---- Discover objects ----
                 cur.execute(
-                    f"SELECT TABLE_NAME FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.TABLES "
-                    f"WHERE TABLE_SCHEMA='{_U(schema_name)}' ORDER BY TABLE_NAME"
+                    f"""SELECT TABLE_NAME
+                        FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA='{_U(schema_name)}'
+                          AND TABLE_TYPE='BASE TABLE'
+                        ORDER BY TABLE_NAME"""
                 )
                 src_tables = [r[0] for r in cur.fetchall()]
 
                 cur.execute(
-                    f"SELECT TABLE_NAME FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.VIEWS "
-                    f"WHERE TABLE_SCHEMA='{_U(schema_name)}' ORDER BY TABLE_NAME"
+                    f"""SELECT TABLE_NAME
+                        FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.VIEWS
+                        WHERE TABLE_SCHEMA='{_U(schema_name)}'
+                        ORDER BY TABLE_NAME"""
                 )
                 src_views = [r[0] for r in cur.fetchall()]
 
-                # ---- Build plan: explicit statements (no scripting placeholders) ----
+                try:
+                    cur.execute(
+                        f"""SELECT TABLE_NAME
+                            FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.MATERIALIZED_VIEWS
+                            WHERE TABLE_SCHEMA='{_U(schema_name)}'
+                            ORDER BY TABLE_NAME"""
+                    )
+                    src_mviews = [r[0] for r in cur.fetchall()]
+                except Exception:
+                    src_mviews = []
+
+                try:
+                    cur.execute(
+                        f"""SELECT SEQUENCE_NAME
+                            FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.SEQUENCES
+                            WHERE SEQUENCE_SCHEMA='{_U(schema_name)}'
+                            ORDER BY SEQUENCE_NAME"""
+                    )
+                    src_sequences = [r[0] for r in cur.fetchall()]
+                except Exception:
+                    src_sequences = []
+
+                try:
+                    cur.execute(
+                        f"""SELECT FILE_FORMAT_NAME
+                            FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.FILE_FORMATS
+                            WHERE FILE_FORMAT_SCHEMA='{_U(schema_name)}'
+                            ORDER BY FILE_FORMAT_NAME"""
+                    )
+                    src_file_formats = [r[0] for r in cur.fetchall()]
+                except Exception:
+                    src_file_formats = []
+
+                # Procedures: name + signature from INFORMATION_SCHEMA.PROCEDURES (may include param names)
+                try:
+                    cur.execute(
+                        f"""SELECT PROCEDURE_NAME, ARGUMENT_SIGNATURE
+                            FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.PROCEDURES
+                            WHERE PROCEDURE_SCHEMA='{_U(schema_name)}'
+                            ORDER BY PROCEDURE_NAME"""
+                    )
+                    src_procs_raw = [(r[0], r[1] or "()") for r in cur.fetchall()]
+                except Exception:
+                    src_procs_raw = []
+
+                # Preload FILE FORMAT metadata from SHOW (index-based to avoid identifier issues)
+                ff_meta: Dict[str, Tuple[str, str]] = {}
+                if src_file_formats:
+                    cur.execute(f"SHOW FILE FORMATS IN SCHEMA {sql_ident(src_db)}.{sql_ident(schema_name)}")
+                    cur.execute("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))")
+                    for row in cur.fetchall():
+                        # positions: 1=name, 4=type, 7=options
+                        name = row[1]
+                        ftype = row[4]
+                        opts  = row[7] or ""
+                        ff_meta[_U(name)] = (ftype, opts)
+
+                # ---- Build plan (idempotent) ----
                 plan_seed: List[str] = []
+                skipped: List[str] = []
                 src_schema_qual = f"{sql_ident(src_db)}.{sql_ident(schema_name)}"
+
+                def try_get_ddl(objtype: str, fq: str) -> Optional[str]:
+                    try:
+                        cur.execute(f"SELECT GET_DDL('{objtype}','{fq}', TRUE)")
+                        return cur.fetchone()[0]
+                    except Exception as e:
+                        skipped.append(f"{objtype}: {fq}  —  {e}")
+                        return None
 
                 for _, tgt_db in targets:
                     tgt_schema_qual = f"{sql_ident(tgt_db)}.{sql_ident(schema_name)}"
-
-                    # Create target db/schema
                     plan_seed.append(f"CREATE DATABASE IF NOT EXISTS {sql_ident(tgt_db)};")
+
                     if destructive:
                         plan_seed.append(f"CREATE OR REPLACE SCHEMA {tgt_schema_qual} CLONE {src_schema_qual};")
                     else:
                         plan_seed.append(f"CREATE SCHEMA IF NOT EXISTS {tgt_schema_qual};")
-                        # Tables: per-object CLONE
+
+                        # Tables → CLONE
                         for t in src_tables:
                             plan_seed.append(
                                 f"CREATE OR REPLACE TABLE {tgt_schema_qual}.{sql_ident(t)} "
                                 f"CLONE {src_schema_qual}.{sql_ident(t)};"
                             )
-                        # Views: fetch DDL, rewrite, append
+
+                        # Views
                         for v in src_views:
-                            cur.execute(
-                                f"SELECT GET_DDL('VIEW','{_U(src_db)}.{_U(schema_name)}.{_U(v)}', TRUE)"
-                            )
-                            ddl = cur.fetchone()[0]
-                            ddl_rewritten = (
+                            ddl = try_get_ddl("VIEW", f"{_U(src_db)}.{_U(schema_name)}.{_U(v)}")
+                            if not ddl:
+                                continue
+                            ddl = (
                                 ddl
                                 .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
                                 .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
+                                .replace("CREATE VIEW", "CREATE OR REPLACE VIEW")
                             )
-                            ddl_rewritten = ddl_rewritten.replace("CREATE VIEW", "CREATE OR REPLACE VIEW")
-                            plan_seed.append(ddl_rewritten.rstrip(";") + ";")
+                            plan_seed.append(ddl.rstrip(";") + ";")
+
+                        # Materialized Views
+                        for mv in src_mviews:
+                            ddl = try_get_ddl("MATERIALIZED VIEW", f"{_U(src_db)}.{_U(schema_name)}.{_U(mv)}")
+                            if not ddl:
+                                continue
+                            ddl = (
+                                ddl
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
+                                .replace("CREATE MATERIALIZED VIEW", "CREATE OR REPLACE MATERIALIZED VIEW")
+                            )
+                            plan_seed.append(ddl.rstrip(";") + ";")
+
+                        # Sequences
+                        for sq in src_sequences:
+                            ddl = try_get_ddl("SEQUENCE", f"{_U(src_db)}.{_U(schema_name)}.{_U(sq)}")
+                            if not ddl:
+                                continue
+                            ddl = (
+                                ddl
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
+                                .replace("CREATE SEQUENCE", "CREATE OR REPLACE SEQUENCE")
+                            )
+                            plan_seed.append(ddl.rstrip(";") + ";")
+
+                        # File Formats (synthesize from SHOW)
+                        for ff in src_file_formats:
+                            meta = ff_meta.get(_U(ff))
+                            if not meta:
+                                skipped.append(f"FILE FORMAT: {_U(src_db)}.{_U(schema_name)}.{_U(ff)}  —  not visible in SHOW")
+                                continue
+                            ff_type, ff_opts = meta
+                            ddl = (
+                                f"CREATE OR REPLACE FILE FORMAT {tgt_schema_qual}.{sql_ident(ff)} "
+                                f"TYPE = {ff_type}"
+                                + (f" {ff_opts}" if ff_opts.strip() else "")
+                                + ";"
+                            )
+                            plan_seed.append(ddl)
+
+                        # -------- Procedures (with signature fallback) --------
+                        for name, raw_sig in src_procs_raw:
+                            candidates = []
+
+                            # 1) raw signature as-is
+                            raw_sig_normed = raw_sig if raw_sig.strip().startswith("(") else f"({raw_sig.strip()})"
+                            candidates.append(raw_sig_normed)
+
+                            # 2) types-only normalized signature
+                            types_only = _normalize_proc_sig(raw_sig_normed)
+                            if types_only not in candidates:
+                                candidates.append(types_only)
+
+                            # 3) from SHOW PROCEDURES
+                            for s in _show_proc_signatures(cur, src_db, schema_name, name):
+                                if s not in candidates:
+                                    candidates.append(s)
+
+                            ddl_obtained = None
+                            for sig in candidates:
+                                fq = f"{_U(src_db)}.{_U(schema_name)}.{_U(name)}{sig}"
+                                try:
+                                    cur.execute(f"SELECT GET_DDL('PROCEDURE','{fq}', TRUE)")
+                                    ddl_obtained = cur.fetchone()[0]
+                                    break
+                                except Exception as e:
+                                    # keep trying other candidates
+                                    continue
+
+                            if not ddl_obtained:
+                                skipped.append(f"PROCEDURE: {_U(src_db)}.{_U(schema_name)}.{_U(name)}  —  GET_DDL failed for all signatures tried: {', '.join(candidates)}")
+                                continue
+
+                            ddl = (
+                                ddl_obtained
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
+                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
+                                .replace("CREATE PROCEDURE", "CREATE OR REPLACE PROCEDURE")
+                            )
+                            plan_seed.append(ddl.rstrip(";") + ";")
 
                     if apply_grants:
                         plan_seed += [
@@ -699,6 +895,9 @@ with tab_migrate:
 
                 st.session_state.plan_seed = plan_seed
                 nice_panel("ETL_CTRL Seeding Plan (resolved)", "\n".join(plan_seed))
+                if skipped:
+                    st.warning("Some objects were skipped (no DDL access or not visible). See details below.")
+                    st.expander("Skipped objects (informational)", expanded=False).write("\n".join(skipped))
                 st.success("Seeding plan built. Review and Execute.")
         except Exception as e:
             st.error(f"Seeding plan build failed: {e}")
@@ -712,7 +911,7 @@ with tab_migrate:
                     success, failures = run_multi_sql(cur, st.session_state.plan_seed)
                 st.session_state.audit = {"success": success, "failures": failures}
                 if failures:
-                    st.error(f"Completed with errors. Rolled back. First error: {failures[0][1]}")
+                    st.warning("Completed with errors. DDL is auto-committed; already-existing or unreadable objects were skipped/replaced where possible.")
                 else:
                     st.success("ETL_CTRL seeded successfully into selected xcenters.")
             except Exception as e:
@@ -727,19 +926,19 @@ with tab_preview_exec:
         st.info("Build a plan in the first tab.")
     else:
         nice_panel("SQL to be executed", "\n".join(st.session_state.plan))
-        st.write("**Execution behavior**: transactional (BEGIN/COMMIT/ROLLBACK), stops on first error.")
+        st.write("**Execution behavior**: runs statements sequentially; DDL is auto-committed in Snowflake.")
 
         if st.session_state.get("setup_dryrun", True):
             st.warning("Dry-run is ON. Disable it in the Setup Plan tab to execute.")
         else:
-            if st.button("Run Plan (Transactional)", type="primary", key="setup_exec_btn"):
+            if st.button("Run Plan (Non-transactional)", type="primary", key="setup_exec_btn"):
                 try:
                     with get_conn() as conn:
                         cur = conn.cursor()
                         success, failures = run_multi_sql(cur, st.session_state.plan)
                     st.session_state.audit = {"success": success, "failures": failures}
                     if failures:
-                        st.error(f"Rolled back due to error. First error: {failures[0][1]}")
+                        st.warning("Completed with errors. Some objects may already exist.")
                     else:
                         st.success("All statements executed successfully.")
                 except Exception as e:
@@ -863,7 +1062,7 @@ with tab_delete:
                         success, failures = run_multi_sql(cur, st.session_state.plan_drop)
                     st.session_state.audit = {"success": success, "failures": failures}
                     if failures:
-                        st.error(f"Rollback occurred due to error. First error: {failures[0][1]}")
+                        st.warning("Completed with errors. DDL is auto-committed; some actions may already have applied.")
                     else:
                         st.success(f"{env_upper}: Selected xcenter environment objects dropped successfully.")
                 except Exception as e:
