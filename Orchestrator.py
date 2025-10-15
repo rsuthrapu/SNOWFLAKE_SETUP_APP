@@ -8,6 +8,14 @@ from cryptography.hazmat.backends import default_backend
 import pathlib
 import re
 
+# Optional: S3 bucket creation
+try:
+    import boto3  # only used if you press the "Create Buckets" button
+    from botocore.exceptions import ClientError
+    HAS_BOTO3 = True
+except Exception:
+    HAS_BOTO3 = False
+
 st.set_page_config(page_title="Snowflake Setup Assistant", page_icon="❄️", layout="wide")
 
 # =========================
@@ -153,15 +161,15 @@ def mk_warehouse_sql(name: str, opts: Dict[str, Any]) -> str:
         f"SCALING_POLICY = '{policy}';"
     )
 
-# =========================
+# ============
 # UI
-# =========================
-st.title("❄️ Snowflake Setup Assistant (Key-pair)")
-st.caption("Create databases, schemas, roles, stages, warehouses — using a service user + RSA key.")
+# ============
+st.title("❄️ Snowflake Setup Assistant ")
+st.caption("Create environments; clone & normalize ETL_CTRL per xcenter; build S3 integrations & stages; optional S3 bucket creation.")
 
 with st.sidebar:
     st.header("Connection (Key-pair)")
-    st.session_state.account = st.text_input("Account (e.g. xy12345.us-east-1)", key="sb_account")
+    st.session_state.account = st.text_input("Account (e.g. Organization Name.Account Name)", key="sb_account")
     st.session_state.user = st.text_input("Service user", value="CLI_USER", key="sb_user")
     st.session_state.role = st.text_input("Role to execute as", value="CLI_ROLE", key="sb_role")
     st.session_state.warehouse = st.text_input("Warehouse", value="WH_DATA_TEAM", key="sb_wh")
@@ -169,7 +177,7 @@ with st.sidebar:
     st.session_state.private_key_passphrase = st.text_input("Key passphrase (if set)", type="password", key="sb_pk_pass")
 
 # Tabs
-tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_preview_exec, tab_audit, tab_delete = st.tabs(
+tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_preview_exec, tab_audit, tab_delete, tab_buckets = st.tabs(
     [
         "Setup Plan",
         "Environment Builder",
@@ -178,7 +186,8 @@ tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_preview_exec, tab
         "Migrate Objects",
         "Preview & Execute",
         "Audit / Logs",
-        "Delete Environment"
+        "Delete Environment",
+        "S3 Buckets"
     ]
 )
 
@@ -206,7 +215,7 @@ with tab_setup:
 
     with col2:
         st.markdown("**Optional Stage (created only in the first DB)**")
-        stage_wanted = st.checkbox("Create a stage", value=True, key="setup_stage_wanted")
+        stage_wanted = st.checkbox("Create a stage", value=False, key="setup_stage_wanted")
         stage_name = st.text_input("Stage name", value="DATA_STAGE", key="setup_stage_name")
         stage_schema = st.text_input("Stage schema (within the DB)", value="STG", key="setup_stage_schema")
         ff = st.selectbox("Default FILE_FORMAT (optional)", ["", "CSV", "JSON", "PARQUET", "AVRO", "ORC", "XML"], key="setup_stage_ff")
@@ -378,7 +387,7 @@ with tab_env:
                     success, failures = run_multi_sql(cur, st.session_state.plan_env)
                 st.session_state.audit = {"success": success, "failures": failures}
                 if failures:
-                    st.warning("Completed with errors. Note: DDL is auto-committed in Snowflake; some objects may already exist.")
+                    st.warning("Completed with errors. DDL is auto-committed in Snowflake; some objects may already exist.")
                 else:
                     st.success("Environment created successfully.")
             except Exception as e:
@@ -453,123 +462,102 @@ with tab_warehouse:
                 st.error(f"Execution failed: {e}")
 
 # -------------------------
-# AWS / S3 Integration
+# AWS / S3 Integration (per xcenter, ETL_CTRL)
 # -------------------------
 with tab_cloud:
-    st.subheader("AWS / S3 Integration Helper (per environment, creates stages in ALL xcenters)")
+    st.subheader("AWS / S3 Integration Helper (targets ETL_CTRL in all xcenters)")
 
     env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="cloud_env")
     env_lower = env.lower()
-    env_upper = env.upper()
 
     st.markdown("**Bucket naming pattern**")
     org_prefix = st.text_input("Org prefix", value="cig", key="cloud_org_prefix")
-    mid_tokens = st.text_input("Middle tokens", value="env-aqs-gw-landing-zone", key="cloud_mid_tokens")
+    mid_tokens = st.text_input("Middle tokens (between env and xcenter)", value="env-aqs-gw-landing-zone", key="cloud_mid_tokens")
     index_token = st.text_input("Index token", value="01", key="cloud_index_token")
     bucket_suffix = "bucket"
 
-    # DB basenames / computed DBs (all 3 xcenters)
-    st.markdown("**Target Databases (all 3 xcenters)**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        base_bc = st.text_input("BC → DB basename", value="BILLING", key="cloud_base_bc")
-    with c2:
-        base_cc = st.text_input("CC → DB basename", value="CLAIMS", key="cloud_base_cc")
-    with c3:
-        base_pc = st.text_input("PC → DB basename", value="POLICY", key="cloud_base_pc")
-
-    tgt_db_bc = f"{_U(base_bc)}_AQS_{env_upper}"
-    tgt_db_cc = f"{_U(base_cc)}_AQS_{env_upper}"
-    tgt_db_pc = f"{_U(base_pc)}_AQS_{env_upper}"
-
-    # Stages in ETL_CTRL as requested
-    target_schema = st.text_input("Target Schema", value="ETL_CTRL", key="cloud_target_schema")
-
-    # Single integration name used for all 3 stages
-    integ_name_default = f"CLAIMS_AWS_AQS_{env_upper}"
-    integ_name = st.text_input("Storage Integration name (shared)", value=integ_name_default, key="cloud_integ_name")
-
-    aws_region = st.text_input("AWS region", value="us-east-1", key="cloud_region")
-    role_arn = st.text_input("AWS IAM Role ARN (from Terraform output)", value="", key="cloud_role_arn")
-    sf_aws_acct = st.text_input("Snowflake AWS Account ID (for your SF region)", value="", key="cloud_sf_aws_acct")
-    st.caption("Tip: run Terraform with external_id=TEMP first, then copy ExternalId from DESC INTEGRATION and re-apply Terraform.")
+    st.markdown("**Xcenters**")
+    use_bc = st.checkbox("BC", value=True, key="cloud_bc")
+    use_cc = st.checkbox("CC", value=True, key="cloud_cc")
+    use_pc = st.checkbox("PC", value=True, key="cloud_pc")
+    xcenters = [c for c, flag in [("bc", use_bc), ("cc", use_cc), ("pc", use_pc)] if flag]
 
     def mk_bucket(xc: str) -> str:
         return f"{org_prefix}-{env_lower}-{mid_tokens}-{xc}-{index_token}-{bucket_suffix}"
 
-    colb1, colb2, colb3 = st.columns(3)
-    with colb1:
-        b_bc = st.text_input("BC bucket", value=mk_bucket("bc"), key="cloud_b_bc")
-    with colb2:
-        b_cc = st.text_input("CC bucket", value=mk_bucket("cc"), key="cloud_b_cc")
-    with colb3:
-        b_pc = st.text_input("PC bucket", value=mk_bucket("pc"), key="cloud_b_pc")
+    # DB map
+    base_map = {"bc": "BILLING", "cc": "CLAIMS", "pc": "POLICY"}
 
-    include_desc = st.checkbox("Include DESC INTEGRATION in plan", value=True, key="cloud_include_desc")
+    st.markdown("**Targets (DB.ETL_CTRL)**")
+    tgt_list = [f"{base_map[xc]}_AQS_{env}.ETL_CTRL" for xc in xcenters]
+    st.code("\n".join(tgt_list) if tgt_list else "—", language="text")
+
+    integ_name_pat = st.text_input("Storage Integration name pattern (<BASE>_AQS_INT)", value="<BASE>_AQS_INT", key="cloud_integ_pat")
+
+    aws_region = st.text_input("AWS region", value="us-east-1", key="cloud_region")
+    role_arn = st.text_input("AWS IAM Role ARN (from Terraform)", value="", key="cloud_role_arn")
+    sf_aws_acct = st.text_input("Snowflake AWS Account ID (for your SF region)", value="", key="cloud_sf_aws_acct")
+    st.caption("Tip: Create the integration once per xcenter (name like BILLING_AQS_INT).")
 
     if st.button("Build Integration + Stages SQL", key="cloud_build_btn"):
-        if not role_arn.strip():
-            st.error("Provide the AWS IAM Role ARN from Terraform output.")
+        if not role_arn:
+            st.error("Provide the AWS IAM Role ARN.")
         else:
-            allowed = ",".join([f"'s3://{bn}/'" for bn in [b_bc, b_cc, b_pc]])
-            sqls = [
-                f"CREATE OR REPLACE STORAGE INTEGRATION {sql_ident(integ_name)} TYPE=EXTERNAL_STAGE STORAGE_PROVIDER='S3' ENABLED=TRUE "
-                f"STORAGE_AWS_ROLE_ARN='{role_arn}' "
-                f"STORAGE_ALLOWED_LOCATIONS=({allowed});"
-            ]
-            if include_desc:
-                sqls.append(f"DESC INTEGRATION {sql_ident(integ_name)};")
+            sqls: List[str] = []
+            for xc in xcenters:
+                base = base_map[xc]
+                db = f"{base}_AQS_{env}".upper()
+                schema = "ETL_CTRL"
+                integ = integ_name_pat.replace("<BASE>", base.upper())
 
-            # create stages in ALL three xcenters under ETL_CTRL
-            stage_names = {"BC": "S3_LZ_BC", "CC": "S3_LZ_CC", "PC": "S3_LZ_PC"}
-            per_xc = [
-                (tgt_db_bc, b_bc, stage_names["BC"]),
-                (tgt_db_cc, b_cc, stage_names["CC"]),
-                (tgt_db_pc, b_pc, stage_names["PC"]),
-            ]
-            for db, bucket, stage in per_xc:
+                bucket = mk_bucket(xc)
+                allowed = f"'s3://{bucket}/'"
+
+                # One integration per xcenter
                 sqls.append(
-                    f"CREATE STAGE IF NOT EXISTS {sql_ident(db)}.{sql_ident(target_schema)}.{sql_ident(stage)} "
-                    f"URL='s3://{bucket}/' STORAGE_INTEGRATION={sql_ident(integ_name)};"
+                    f"CREATE OR REPLACE STORAGE INTEGRATION {sql_ident(integ)} TYPE=EXTERNAL_STAGE "
+                    f"STORAGE_PROVIDER='S3' ENABLED=TRUE STORAGE_AWS_ROLE_ARN='{role_arn}' "
+                    f"STORAGE_ALLOWED_LOCATIONS=({allowed});",
+
+                )
+                sqls.append(f"DESC INTEGRATION {sql_ident(integ)}; -- copy ExternalId for your IAM trust policy")
+
+                # Two stages in ETL_CTRL per xcenter
+                stage_manifest = f"STAGE_{xc.upper()}_MANIFEST_DETAILS"
+                stage_stg = f"STAGE_{xc.upper()}_STG"
+
+                sqls.append(
+                    f"CREATE STAGE IF NOT EXISTS {sql_ident(db)}.{sql_ident(schema)}.{sql_ident(stage_manifest)} "
+                    f"URL='s3://{bucket}/manifest.json' STORAGE_INTEGRATION={sql_ident(integ)};"
+                )
+                sqls.append(
+                    f"CREATE STAGE IF NOT EXISTS {sql_ident(db)}.{sql_ident(schema)}.{sql_ident(stage_stg)} "
+                    f"URL='s3://{bucket}/' STORAGE_INTEGRATION={sql_ident(integ)};"
                 )
 
             st.session_state.plan_cloud = [s if s.endswith(";") else s + ";" for s in sqls]
-            st.success(f"Built Integration + 3 stages for {env_upper}. Review below.")
+            st.success(f"Built Integration + stages SQL for {len(xcenters)} xcenter(s). Review below.")
             nice_panel("Integration SQL Plan", "\n".join(st.session_state.plan_cloud))
 
     if st.session_state.get("plan_cloud"):
-        if st.button("Execute Integration Plan", type="primary", key="cloud_exec_btn"):
+        if st.button("Execute Integration + Stages SQL", type="primary", key="cloud_exec_btn"):
             try:
                 with get_conn() as conn:
                     cur = conn.cursor()
                     success, failures = run_multi_sql(cur, st.session_state.plan_cloud)
                 st.session_state.audit = {"success": success, "failures": failures}
                 if failures:
-                    st.warning("Completed with errors. Some steps may need privileged role (e.g., CREATE INTEGRATION requires ACCOUNTADMIN or a delegated role).")
+                    st.warning("Completed with errors. Some statements may require higher privileges.")
                 else:
-                    st.success("Storage integration and all stages created successfully.")
+                    st.success("Integrations / stages created.")
             except Exception as e:
                 st.error(f"Execution failed: {e}")
 
-    st.markdown("**Terraform apply helper**")
-    tf_bullets = []
-    tf_bullets.append(f'-var="project_prefix={org_prefix}-{env_lower}"')
-    tf_bullets.append(f'-var="region={aws_region}"')
-    tf_bullets.append(f'-var="snowflake_aws_account_id={sf_aws_acct or "<SNOWFLAKE_AWS_ACCT_ID>"}"')
-    tf_bullets.append('-var="external_id=TEMP"  # replace with real value from DESC INTEGRATION later')
-
-    st.code(
-        "terraform -chdir=infra/aws init\n"
-        f"terraform -chdir=infra/aws apply \\\n  " + " \\\n  ".join(tf_bullets) + "\n",
-        language="bash"
-    )
-    st.info("Flow: 1) Apply Terraform with external_id=TEMP → 2) Execute Integration Plan here → 3) Copy ExternalId from DESC INTEGRATION → 4) Re-apply Terraform with that ExternalId.")
-
 # -------------------------
-# ETL_CTRL Seeder (environment-aware, with procedure fallback)
+# ETL_CTRL Seeder + Post-clone normalizer
 # -------------------------
 with tab_migrate:
-    st.subheader("Seed ETL_CTRL into xcenter databases (by environment)")
+    st.subheader("Seed ETL_CTRL into xcenter databases (by environment) — with post-clone renames & grants")
 
     # ---- Settings ----
     env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="seed_env")
@@ -588,9 +576,9 @@ with tab_migrate:
         base_pc = st.text_input("PC → DB basename", value="POLICY", key="seed_base_pc")
         do_pc   = st.checkbox("Seed PC", value=True, key="seed_do_pc")
 
-    destructive   = st.checkbox("CREATE OR REPLACE ETL_CTRL in targets (destructive)", value=False, key="seed_replace")
-    truncate_after_clone = st.checkbox("After destructive clone, TRUNCATE all tables in targets", value=True, key="seed_truncate")
-    apply_grants  = st.checkbox("Apply basic grants on target ETL_CTRL (AQS_APP_* roles)", value=True, key="seed_apply_grants")
+    destructive   = st.checkbox("CREATE OR REPLACE ETL_CTRL in targets (destructive CLONE)", value=True, key="seed_replace")
+    truncate_after_clone = st.checkbox("After clone, TRUNCATE all tables in ETL_CTRL", value=True, key="seed_truncate")
+    apply_grants  = st.checkbox("Grant AQS_APP_* on target ETL_CTRL objects", value=True, key="seed_apply_grants")
 
     # Compute targets
     targets = []
@@ -603,12 +591,19 @@ with tab_migrate:
     else:
         st.info("No targets selected yet.")
 
-    # ---- Signature normalization helpers for procedures ----
+    # Helper to make bucket per xc
+    def bucket_for(org_prefix: str, env_lower: str, mid_tokens: str, index_token: str, xc: str) -> str:
+        return f"{org_prefix}-{env_lower}-{mid_tokens}-{xc}-{index_token}-bucket"
+
+    # Post-clone normalization inputs
+    st.markdown("**Post-clone normalization (stage URLs, view names, integrations)**")
+    org_prefix = st.text_input("Org prefix", value="cig", key="seed_org_prefix")
+    mid_tokens = st.text_input("Middle tokens", value="env-aqs-gw-landing-zone", key="seed_mid_tokens")
+    index_token = st.text_input("Index token", value="01", key="seed_index_token")
+    integ_name_pat = st.text_input("Integration name pattern (<BASE>_AQS_INT)", value="<BASE>_AQS_INT", key="seed_integ_pat")
+
+    # ---- Signature normalization helpers for procedures (unchanged) ----
     def _normalize_proc_sig(sig: str) -> str:
-        """
-        Convert '(PARAM TYPE, PARAM2 TYPE2(10,2))' -> '(TYPE, TYPE2(10,2))'.
-        Accepts already-typed only sigs and returns them unchanged.
-        """
         s = (sig or "").strip()
         if not s.startswith("(") or not s.endswith(")"):
             return "()"
@@ -616,7 +611,6 @@ with tab_migrate:
         if not inner:
             return "()"
         parts = []
-        # split on commas not inside parentheses
         depth = 0
         start = 0
         for i, ch in enumerate(inner):
@@ -639,10 +633,6 @@ with tab_migrate:
         return "(" + ", ".join(types_only) + ")"
 
     def _show_proc_signatures(cur, db: str, schema: str, name: str) -> List[str]:
-        """
-        Returns a list of candidate signatures (types-only) for a procedure name
-        using SHOW PROCEDURES IN SCHEMA.
-        """
         try:
             cur.execute(f"SHOW PROCEDURES LIKE '{_U(name)}' IN SCHEMA {sql_ident(db)}.{sql_ident(schema)}")
             cur.execute("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))")
@@ -654,61 +644,20 @@ with tab_migrate:
                     continue
                 args_sig = f"({args})" if args is not None else "()"
                 sigs.append(_normalize_proc_sig(args_sig))
-            seen = set()
-            uniq = []
+            seen = set(); out=[]
             for s in sigs:
                 if s not in seen:
-                    seen.add(s)
-                    uniq.append(s)
-            return uniq
+                    seen.add(s); out.append(s)
+            return out
         except Exception:
             return []
 
-    if st.button("Build ETL_CTRL Seeding Plan", key="seed_build_btn"):
+    if st.button("Build ETL_CTRL Seeding + Normalize Plan", key="seed_build_btn"):
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
 
-                # ---- Source checks ----
-                src_exists  = db_exists(cur, src_db)
-                src_schema  = schema_exists_via_info_schema(cur, src_db, schema_name)
-                src_read_ok = can_read_schema_tables(cur, src_db, schema_name)
-                src_usage   = has_usage_on_db(cur, src_db)
-
-                st.caption(
-                    f"🔎 Preflight debug · src_exists={src_exists} · src_schema={src_schema} · "
-                    f"can_read_src_schema={src_read_ok} · has_usage_on_db={src_usage}"
-                )
-
-                preflight = []
-                if not src_exists:
-                    preflight.append(f"❌ Database **{src_db}** does not exist (or not visible).")
-                if not (src_schema or src_read_ok):
-                    preflight.append(f"❌ Schema **{src_db}.{schema_name}** not found (or not visible).")
-                if not src_usage:
-                    preflight.append(
-                        "❌ Role likely lacks USAGE on source. Ensure:\n"
-                        f"  GRANT USAGE ON DATABASE {sql_ident(src_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};\n"
-                        f"  GRANT USAGE ON SCHEMA {sql_ident(src_db)}.{sql_ident(schema_name)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};"
-                    )
-
-                # Targets preflight
-                for _, tgt_db in targets:
-                    if not db_exists(cur, tgt_db):
-                        preflight.append(f"ℹ️ Target DB **{tgt_db}** does not exist yet (will be created).")
-                    elif not has_usage_on_db(cur, tgt_db):
-                        preflight.append(
-                            f"❌ No USAGE on target DB **{tgt_db}**. Grant at least:\n"
-                            f"  GRANT USAGE ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};\n"
-                            f"  GRANT CREATE SCHEMA ON DATABASE {sql_ident(tgt_db)} TO ROLE {sql_ident(st.session_state.get('role','CLI_ROLE'))};"
-                        )
-                if preflight:
-                    nice_panel("Preflight report", "\n".join(preflight))
-                if (not src_exists) or (not (src_schema or src_read_ok)):
-                    st.error(f"Preflight failed. Fix the items above (especially visibility/USAGE on {src_db}.{schema_name}) and rebuild.")
-                    st.stop()
-
-                # ---- Discover objects ----
+                # ---- Discover objects in source (only needed for non-destructive path) ----
                 cur.execute(
                     f"""SELECT TABLE_NAME
                         FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.TABLES
@@ -728,28 +677,6 @@ with tab_migrate:
 
                 try:
                     cur.execute(
-                        f"""SELECT TABLE_NAME
-                            FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.MATERIALIZED_VIEWS
-                            WHERE TABLE_SCHEMA='{_U(schema_name)}'
-                            ORDER BY TABLE_NAME"""
-                    )
-                    src_mviews = [r[0] for r in cur.fetchall()]
-                except Exception:
-                    src_mviews = []
-
-                try:
-                    cur.execute(
-                        f"""SELECT SEQUENCE_NAME
-                            FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.SEQUENCES
-                            WHERE SEQUENCE_SCHEMA='{_U(schema_name)}'
-                            ORDER BY SEQUENCE_NAME"""
-                    )
-                    src_sequences = [r[0] for r in cur.fetchall()]
-                except Exception:
-                    src_sequences = []
-
-                try:
-                    cur.execute(
                         f"""SELECT FILE_FORMAT_NAME
                             FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.FILE_FORMATS
                             WHERE FILE_FORMAT_SCHEMA='{_U(schema_name)}'
@@ -759,7 +686,6 @@ with tab_migrate:
                 except Exception:
                     src_file_formats = []
 
-                # Procedures: name + signature from INFORMATION_SCHEMA.PROCEDURES
                 try:
                     cur.execute(
                         f"""SELECT PROCEDURE_NAME, ARGUMENT_SIGNATURE
@@ -771,18 +697,7 @@ with tab_migrate:
                 except Exception:
                     src_procs_raw = []
 
-                # Preload FILE FORMAT metadata from SHOW
-                ff_meta: Dict[str, Tuple[str, str]] = {}
-                if src_file_formats:
-                    cur.execute(f"SHOW FILE FORMATS IN SCHEMA {sql_ident(src_db)}.{sql_ident(schema_name)}")
-                    cur.execute("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))")
-                    for row in cur.fetchall():
-                        name = row[1]   # file format name
-                        ftype = row[4]  # type
-                        opts  = row[7] or ""  # options
-                        ff_meta[_U(name)] = (ftype, opts)
-
-                # ---- Build plan (idempotent) ----
+                # Build plan
                 plan_seed: List[str] = []
                 skipped: List[str] = []
                 src_schema_qual = f"{sql_ident(src_db)}.{sql_ident(schema_name)}"
@@ -795,135 +710,150 @@ with tab_migrate:
                         skipped.append(f"{objtype}: {fq}  —  {e}")
                         return None
 
-                for _, tgt_db in targets:
+                for xc, tgt_db in targets:
                     tgt_schema_qual = f"{sql_ident(tgt_db)}.{sql_ident(schema_name)}"
                     plan_seed.append(f"CREATE DATABASE IF NOT EXISTS {sql_ident(tgt_db)};")
 
                     if destructive:
                         plan_seed.append(f"CREATE OR REPLACE SCHEMA {tgt_schema_qual} CLONE {src_schema_qual};")
-                        # Optional: wipe data post-clone
-                        if truncate_after_clone and src_tables:
-                            for t in src_tables:
-                                plan_seed.append(f"TRUNCATE TABLE {tgt_schema_qual}.{sql_ident(t)};")
                     else:
                         plan_seed.append(f"CREATE SCHEMA IF NOT EXISTS {tgt_schema_qual};")
-
-                        # Tables → CLONE (will copy data). If you need empty tables in this mode,
-                        # replace clone with CREATE TABLE LIKE ...; left as-is since you use destructive.
+                        # Minimal copy path (not main path now)
                         for t in src_tables:
                             plan_seed.append(
                                 f"CREATE OR REPLACE TABLE {tgt_schema_qual}.{sql_ident(t)} "
                                 f"CLONE {src_schema_qual}.{sql_ident(t)};"
                             )
-
-                        # Views
                         for v in src_views:
                             ddl = try_get_ddl("VIEW", f"{_U(src_db)}.{_U(schema_name)}.{_U(v)}")
-                            if not ddl:
-                                continue
-                            ddl = (
-                                ddl
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
-                                .replace("CREATE VIEW", "CREATE OR REPLACE VIEW")
-                            )
-                            plan_seed.append(ddl.rstrip(";") + ";")
+                            if ddl:
+                                ddl = ddl.replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
+                                ddl = re.sub(r"\bCREATE\s+VIEW\b", "CREATE OR REPLACE VIEW", ddl, flags=re.I)
+                                plan_seed.append(ddl.rstrip(";") + ";")
 
-                        # Materialized Views
-                        for mv in src_mviews:
-                            ddl = try_get_ddl("MATERIALIZED VIEW", f"{_U(src_db)}.{_U(schema_name)}.{_U(mv)}")
-                            if not ddl:
-                                continue
-                            ddl = (
-                                ddl
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
-                                .replace("CREATE MATERIALIZED VIEW", "CREATE OR REPLACE MATERIALIZED VIEW")
-                            )
-                            plan_seed.append(ddl.rstrip(";") + ";")
+                    # Optional: truncate all tables after clone
+                    if truncate_after_clone:
+                        plan_seed.append(
+                            f"BEGIN "
+                            f"LET c CURSOR FOR SELECT TABLE_NAME FROM {sql_ident(tgt_db)}.INFORMATION_SCHEMA.TABLES "
+                            f"WHERE TABLE_SCHEMA='{_U(schema_name)}' AND TABLE_TYPE='BASE TABLE'; "
+                            f"FOR r IN c DO EXECUTE IMMEDIATE "
+                            f"'TRUNCATE TABLE {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||r.TABLE_NAME; END FOR; END;"
+                        )
 
-                        # Sequences
-                        for sq in src_sequences:
-                            ddl = try_get_ddl("SEQUENCE", f"{_U(src_db)}.{_U(schema_name)}.{_U(sq)}")
-                            if not ddl:
-                                continue
-                            ddl = (
-                                ddl
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
-                                .replace("CREATE SEQUENCE", "CREATE OR REPLACE SEQUENCE")
-                            )
-                            plan_seed.append(ddl.rstrip(";") + ";")
+                    # ---------- Post-clone normalization per xcenter ----------
+                    base = tgt_db.split("_AQS_")[0]
+                    integ = integ_name_pat.replace("<BASE>", base.upper())
+                    bucket = bucket_for(org_prefix, env.lower(), mid_tokens, index_token, xc.lower())
 
-                        # File Formats (synthesize from SHOW)
-                        for ff in src_file_formats:
-                            meta = ff_meta.get(_U(ff))
-                            if not meta:
-                                skipped.append(f"FILE FORMAT: {_U(src_db)}.{_U(schema_name)}.{_U(ff)}  —  not visible in SHOW")
-                                continue
-                            ff_type, ff_opts = meta
-                            ddl = (
-                                f"CREATE OR REPLACE FILE FORMAT {tgt_schema_qual}.{sql_ident(ff)} "
-                                f"TYPE = {ff_type}"
-                                + (f" {ff_opts}" if ff_opts.strip() else "")
-                                + ";"
-                            )
-                            plan_seed.append(ddl)
+                    # 1) rename stages (if present) and set URL + integration
+                    src_stage_manifest = f"{tgt_schema_qual}.STAGE_CC_MANIFEST_DETAILS"
+                    new_stage_manifest = f"{tgt_schema_qual}.STAGE_{xc}_MANIFEST_DETAILS"
+                    plan_seed.append(f"ALTER STAGE IF EXISTS {src_stage_manifest} RENAME TO STAGE_{xc}_MANIFEST_DETAILS;")
+                    plan_seed.append(
+                        f"CREATE STAGE IF NOT EXISTS {new_stage_manifest};"
+                    )
+                    plan_seed.append(
+                        f"ALTER STAGE {new_stage_manifest} "
+                        f"SET URL='s3://{bucket}/manifest.json', STORAGE_INTEGRATION={sql_ident(integ)};"
+                    )
 
-                        # -------- Procedures (with signature fallback) --------
-                        for name, raw_sig in src_procs_raw:
-                            candidates = []
-                            raw_sig_normed = raw_sig if raw_sig.strip().startswith("(") else f"({raw_sig.strip()})"
-                            candidates.append(raw_sig_normed)
-                            types_only = _normalize_proc_sig(raw_sig_normed)
-                            if types_only not in candidates:
-                                candidates.append(types_only)
-                            for s in _show_proc_signatures(cur, src_db, schema_name, name):
-                                if s not in candidates:
-                                    candidates.append(s)
+                    src_stage_stg = f"{tgt_schema_qual}.STAGE_CLAIMS_STG"
+                    new_stage_stg = f"{tgt_schema_qual}.STAGE_{xc}_STG"
+                    plan_seed.append(f"ALTER STAGE IF EXISTS {src_stage_stg} RENAME TO STAGE_{xc}_STG;")
+                    plan_seed.append(
+                        f"CREATE STAGE IF NOT EXISTS {new_stage_stg};"
+                    )
+                    plan_seed.append(
+                        f"ALTER STAGE {new_stage_stg} "
+                        f"SET URL='s3://{bucket}/', STORAGE_INTEGRATION={sql_ident(integ)};"
+                    )
 
-                            ddl_obtained = None
-                            for sig in candidates:
-                                fq = f"{_U(src_db)}.{_U(schema_name)}.{_U(name)}{sig}"
-                                try:
-                                    cur.execute(f"SELECT GET_DDL('PROCEDURE','{fq}', TRUE)")
-                                    ddl_obtained = cur.fetchone()[0]
-                                    break
-                                except Exception:
-                                    continue
+                    # 2) rename / recreate views and rewrite stage references (case-insensitive)
+                    plan_seed.append(
+                        f"""BEGIN
+DECLARE v_old STRING;
+DECLARE v_new STRING := 'V_JSON_{xc}_MANIFEST_DETAILS';
+DECLARE c CURSOR FOR
+  SELECT TABLE_NAME
+  FROM {sql_ident(tgt_db)}.INFORMATION_SCHEMA.VIEWS
+  WHERE TABLE_SCHEMA='{_U(schema_name)}'
+    AND UPPER(TABLE_NAME) LIKE 'V_JSON_%_MANIFEST_DETAILS';
+FOR r IN c DO
+  v_old := r.TABLE_NAME;
 
-                            if not ddl_obtained:
-                                skipped.append(f"PROCEDURE: {_U(src_db)}.{_U(schema_name)}.{_U(name)}  —  GET_DDL failed for tried signatures: {', '.join(candidates)}")
-                                continue
+  -- Full DDL of the source view
+  LET ddl STRING := GET_DDL('VIEW','{_U(tgt_db)}.{_U(schema_name)}.'||v_old, TRUE);
 
-                            ddl = (
-                                ddl_obtained
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}.", f"{_U(tgt_db)}.{_U(schema_name)}.")
-                                .replace(f"{_U(src_db)}.{_U(schema_name)}",  f"{_U(tgt_db)}.{_U(schema_name)}")
-                                .replace("CREATE PROCEDURE", "CREATE OR REPLACE PROCEDURE")
-                            )
-                            plan_seed.append(ddl.rstrip(";") + ";")
+  -- Extract the SELECT portion robustly, ignoring case and newlines
+  LET sel STRING := REGEXP_SUBSTR(ddl, '(?is)\\bas\\b\\s*(.*)$', 1, 1, 'is', 1);
 
+  -- Replace any of these forms:
+  --   @etl_ctrl.stage_cc_manifest_details
+  --   @"ETL_CTRL"."STAGE_CC_MANIFEST_DETAILS"
+  --   @STAGE_CC_MANIFEST_DETAILS
+  -- with: @ETL_CTRL.STAGE_{xc}_MANIFEST_DETAILS
+  LET sel2 STRING := REGEXP_REPLACE(sel,
+    '@("?[A-Za-z0-9_]+"?\\.)?"?ETL_CTRL"?\\."?STAGE_CC_MANIFEST_DETAILS"?',
+    '@ETL_CTRL.STAGE_{xc}_MANIFEST_DETAILS', 1, 0, 'i');
+
+  LET sel3 STRING := REGEXP_REPLACE(sel2,
+    '@"?STAGE_CC_MANIFEST_DETAILS"?',
+    '@ETL_CTRL.STAGE_{xc}_MANIFEST_DETAILS', 1, 0, 'i');
+
+  EXECUTE IMMEDIATE
+    'CREATE OR REPLACE VIEW {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||v_new||' AS '||sel3;
+
+  IF (UPPER(v_old) <> UPPER(v_new)) THEN
+    EXECUTE IMMEDIATE 'DROP VIEW IF EXISTS {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||v_old;
+  END IF;
+END FOR;
+END;"""
+                    )
+
+                    # 3) Grants on objects (keep PROD_SYSADMIN as-is)
                     if apply_grants:
                         plan_seed += [
                             f"GRANT USAGE ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_READER')};",
                             f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_WRITER')};",
                             f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_ADMIN')};",
                         ]
+                        # object grants (stages, file formats, procedures)
+                        plan_seed += [
+                            f"GRANT USAGE ON STAGE {new_stage_manifest} TO ROLE {sql_ident('AQS_APP_READER')};",
+                            f"GRANT USAGE ON STAGE {new_stage_manifest} TO ROLE {sql_ident('AQS_APP_WRITER')};",
+                            f"GRANT USAGE ON STAGE {new_stage_manifest} TO ROLE {sql_ident('AQS_APP_ADMIN')};",
+                            f"GRANT USAGE ON STAGE {new_stage_stg} TO ROLE {sql_ident('AQS_APP_READER')};",
+                            f"GRANT USAGE ON STAGE {new_stage_stg} TO ROLE {sql_ident('AQS_APP_WRITER')};",
+                            f"GRANT USAGE ON STAGE {new_stage_stg} TO ROLE {sql_ident('AQS_APP_ADMIN')};",
+                            f"""BEGIN
+DECLARE c1 CURSOR FOR SELECT FILE_FORMAT_NAME FROM {sql_ident(tgt_db)}.INFORMATION_SCHEMA.FILE_FORMATS WHERE FILE_FORMAT_SCHEMA='{_U(schema_name)}';
+FOR r IN c1 DO
+  EXECUTE IMMEDIATE 'GRANT USAGE ON FILE FORMAT {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||r.FILE_FORMAT_NAME||' TO ROLE {sql_ident('AQS_APP_READER')}';
+  EXECUTE IMMEDIATE 'GRANT USAGE ON FILE FORMAT {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||r.FILE_FORMAT_NAME||' TO ROLE {sql_ident('AQS_APP_WRITER')}';
+  EXECUTE IMMEDIATE 'GRANT USAGE ON FILE FORMAT {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||r.FILE_FORMAT_NAME||' TO ROLE {sql_ident('AQS_APP_ADMIN')}';
+END FOR;
+DECLARE c2 CURSOR FOR SELECT PROCEDURE_NAME, COALESCE(ARGUMENT_SIGNATURE,'()') FROM {sql_ident(tgt_db)}.INFORMATION_SCHEMA.PROCEDURES WHERE PROCEDURE_SCHEMA='{_U(schema_name)}';
+FOR p IN c2 DO
+  EXECUTE IMMEDIATE 'GRANT USAGE ON PROCEDURE {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||p.PROCEDURE_NAME||p.ARGUMENT_SIGNATURE||' TO ROLE {sql_ident('AQS_APP_READER')}';
+  EXECUTE IMMEDIATE 'GRANT USAGE ON PROCEDURE {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||p.PROCEDURE_NAME||p.ARGUMENT_SIGNATURE||' TO ROLE {sql_ident('AQS_APP_WRITER')}';
+  EXECUTE IMMEDIATE 'GRANT USAGE ON PROCEDURE {sql_ident(tgt_db)}.{sql_ident(schema_name)}.'||p.PROCEDURE_NAME||p.ARGUMENT_SIGNATURE||' TO ROLE {sql_ident('AQS_APP_ADMIN')}';
+END FOR;
+END;"""
+                        ]
 
                 st.session_state.plan_seed = plan_seed
-                nice_panel("ETL_CTRL Seeding Plan (resolved)", "\n".join(plan_seed))
+                nice_panel("ETL_CTRL Seeding + Normalize Plan (resolved)", "\n".join(plan_seed))
                 if skipped:
-                    st.warning("Some objects were skipped (no DDL access or not visible). Expand to see details.")
-                    with st.expander("Skipped objects (informational)"):
-                        st.code("\n".join(skipped))
-                st.success("Seeding plan built. Review and Execute.")
+                    st.warning("Some objects were skipped (no DDL access or not visible). See details below.")
+                    st.expander("Skipped objects (informational)", expanded=False).write("\n".join(skipped))
+                st.success("Plan built. Review and Execute.")
         except Exception as e:
             st.error(f"Seeding plan build failed: {e}")
 
     # Execute
     if st.session_state.get("plan_seed"):
-        if st.button("Execute ETL_CTRL Seeding Plan", type="primary", key="seed_exec_btn"):
+        if st.button("Execute Seeding + Normalize Plan", type="primary", key="seed_exec_btn"):
             try:
                 with get_conn() as conn:
                     cur = conn.cursor()
@@ -932,7 +862,7 @@ with tab_migrate:
                 if failures:
                     st.warning("Completed with errors. DDL is auto-committed; already-existing or unreadable objects were skipped/replaced where possible.")
                 else:
-                    st.success("ETL_CTRL seeded successfully into selected xcenters.")
+                    st.success("ETL_CTRL cloned, normalized, and granted for selected xcenters.")
             except Exception as e:
                 st.error(f"Execution failed: {e}")
 
@@ -1092,5 +1022,65 @@ with tab_delete:
             else:
                 st.info("Execution disabled until the confirmation text matches the environment (DEV, QA, or STG).")
 
+# -------------------------
+# Optional: Create S3 landing buckets
+# -------------------------
+with tab_buckets:
+    st.subheader("Create S3 Landing Buckets (optional)")
+
+    if not HAS_BOTO3:
+        st.warning("boto3 not installed in this environment. Install boto3 to enable bucket creation.")
+    region = st.text_input("AWS Region", value="us-east-1", key="bkt_region")
+    aws_access_key = st.text_input("AWS Access Key ID", value="", key="bkt_key")
+    aws_secret_key = st.text_input("AWS Secret Access Key", value="", type="password", key="bkt_secret")
+    env_b = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="bkt_env")
+    org_prefix_b = st.text_input("Org prefix", value="cig", key="bkt_org")
+    mid_tokens_b = st.text_input("Middle tokens", value="env-aqs-gw-landing-zone", key="bkt_mid")
+    index_token_b = st.text_input("Index token", value="01", key="bkt_idx")
+
+    want_bc_b = st.checkbox("Create BC bucket", value=True, key="bkt_bc")
+    want_cc_b = st.checkbox("Create CC bucket", value=True, key="bkt_cc")
+    want_pc_b = st.checkbox("Create PC bucket", value=True, key="bkt_pc")
+
+    def name_for(xc: str) -> str:
+        return f"{org_prefix_b}-{env_b.lower()}-{mid_tokens_b}-{xc}-{index_token_b}-bucket"
+
+    preview = []
+    if want_bc_b: preview.append(name_for("bc"))
+    if want_cc_b: preview.append(name_for("cc"))
+    if want_pc_b: preview.append(name_for("pc"))
+    st.code("\n".join(preview) if preview else "—", language="text")
+
+    if st.button("Create Buckets Now", key="bkt_create_btn"):
+        if not HAS_BOTO3:
+            st.error("boto3 is not available here.")
+        elif not (aws_access_key and aws_secret_key):
+            st.error("Enter AWS Access Key ID and Secret Access Key.")
+        else:
+            try:
+                session = boto3.session.Session(
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                    region_name=region
+                )
+                s3 = session.client("s3")
+                created = []
+                for bn in preview:
+                    cfg = {} if region == "us-east-1" else {"LocationConstraint": region}
+                    try:
+                        if region == "us-east-1":
+                            s3.create_bucket(Bucket=bn)
+                        else:
+                            s3.create_bucket(Bucket=bn, CreateBucketConfiguration=cfg)
+                        created.append(bn)
+                    except ClientError as ce:
+                        if ce.response["Error"]["Code"] == "BucketAlreadyOwnedByYou":
+                            created.append(f"{bn} (already exists)")
+                        else:
+                            raise
+                st.success("Buckets created / verified:\n" + "\n".join(created))
+            except Exception as e:
+                st.error(f"Bucket creation failed: {e}")
+
 st.divider()
-st.caption("Key-pair auth with service user (CLI_USER). Apply least-privilege grants in production.")
+st.caption("Key-pair auth with service user (CLI_USER). Apply least-privilege grants in production. For S3 bucket creation we use AWS Access Key/Secret to call AWS APIs.")
