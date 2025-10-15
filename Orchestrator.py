@@ -61,7 +61,7 @@ def run_multi_sql(cursor, stmts: List[str]) -> Tuple[List[Tuple[str, Optional[st
     """Execute statements sequentially (no explicit transaction). DDL auto-commits in Snowflake."""
     successes, failures = [], []
     for s in stmts:
-        sql = s.strip()
+        sql = s.strip().rstrip(";")
         if not sql:
             continue
         try:
@@ -456,22 +456,43 @@ with tab_warehouse:
 # AWS / S3 Integration
 # -------------------------
 with tab_cloud:
-    st.subheader("AWS / S3 Integration Helper (per environment, per xcenter)")
+    st.subheader("AWS / S3 Integration Helper (per environment, creates stages in ALL xcenters)")
 
     env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="cloud_env")
     env_lower = env.lower()
+    env_upper = env.upper()
 
     st.markdown("**Bucket naming pattern**")
-    org_prefix = st.text_input("Org prefix", value="abc", key="cloud_org_prefix")
-    mid_tokens = st.text_input("Middle tokens (between env and xcenter)", value="env-aqs-gw-landing-zone", key="cloud_mid_tokens")
+    org_prefix = st.text_input("Org prefix", value="cig", key="cloud_org_prefix")
+    mid_tokens = st.text_input("Middle tokens", value="env-aqs-gw-landing-zone", key="cloud_mid_tokens")
     index_token = st.text_input("Index token", value="01", key="cloud_index_token")
     bucket_suffix = "bucket"
 
-    st.markdown("**Xcenters**")
-    use_bc = st.checkbox("BC", value=True, key="cloud_bc")
-    use_cc = st.checkbox("CC", value=True, key="cloud_cc")
-    use_pc = st.checkbox("PC", value=True, key="cloud_pc")
-    xcenters = [c for c, flag in [("bc", use_bc), ("cc", use_cc), ("pc", use_pc)] if flag]
+    # DB basenames / computed DBs (all 3 xcenters)
+    st.markdown("**Target Databases (all 3 xcenters)**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        base_bc = st.text_input("BC → DB basename", value="BILLING", key="cloud_base_bc")
+    with c2:
+        base_cc = st.text_input("CC → DB basename", value="CLAIMS", key="cloud_base_cc")
+    with c3:
+        base_pc = st.text_input("PC → DB basename", value="POLICY", key="cloud_base_pc")
+
+    tgt_db_bc = f"{_U(base_bc)}_AQS_{env_upper}"
+    tgt_db_cc = f"{_U(base_cc)}_AQS_{env_upper}"
+    tgt_db_pc = f"{_U(base_pc)}_AQS_{env_upper}"
+
+    # Stages in ETL_CTRL as requested
+    target_schema = st.text_input("Target Schema", value="ETL_CTRL", key="cloud_target_schema")
+
+    # Single integration name used for all 3 stages
+    integ_name_default = f"CLAIMS_AWS_AQS_{env_upper}"
+    integ_name = st.text_input("Storage Integration name (shared)", value=integ_name_default, key="cloud_integ_name")
+
+    aws_region = st.text_input("AWS region", value="us-east-1", key="cloud_region")
+    role_arn = st.text_input("AWS IAM Role ARN (from Terraform output)", value="", key="cloud_role_arn")
+    sf_aws_acct = st.text_input("Snowflake AWS Account ID (for your SF region)", value="", key="cloud_sf_aws_acct")
+    st.caption("Tip: run Terraform with external_id=TEMP first, then copy ExternalId from DESC INTEGRATION and re-apply Terraform.")
 
     def mk_bucket(xc: str) -> str:
         return f"{org_prefix}-{env_lower}-{mid_tokens}-{xc}-{index_token}-{bucket_suffix}"
@@ -484,43 +505,51 @@ with tab_cloud:
     with colb3:
         b_pc = st.text_input("PC bucket", value=mk_bucket("pc"), key="cloud_b_pc")
 
-    st.markdown("**Target in Snowflake**")
-    target_db = st.text_input("Target Database", value=f"AQS_{env}", key="cloud_target_db")
-    target_schema = st.text_input("Target Schema", value="STG", key="cloud_target_schema")
-    integ_name = st.text_input("Storage Integration name", value=f"AQS_S3_INT_{env}", key="cloud_integ_name")
-
-    aws_region = st.text_input("AWS region", value="us-east-1", key="cloud_region")
-    role_arn = st.text_input("AWS IAM Role ARN (from Terraform output)", value="", key="cloud_role_arn")
-    sf_aws_acct = st.text_input("Snowflake AWS Account ID (for your SF region)", value="", key="cloud_sf_aws_acct")
-    st.caption("Tip: first run Terraform with external_id=TEMP, then after `DESC INTEGRATION` re-apply with the real ExternalId.")
+    include_desc = st.checkbox("Include DESC INTEGRATION in plan", value=True, key="cloud_include_desc")
 
     if st.button("Build Integration + Stages SQL", key="cloud_build_btn"):
-        if not role_arn:
+        if not role_arn.strip():
             st.error("Provide the AWS IAM Role ARN from Terraform output.")
         else:
-            buckets_map = {"bc": b_bc, "cc": b_cc, "pc": b_pc}
-            selected_buckets = [buckets_map[xc] for xc in xcenters]
-            allowed = ",".join([f"'s3://{bn}/'" for bn in selected_buckets])
-
+            allowed = ",".join([f"'s3://{bn}/'" for bn in [b_bc, b_cc, b_pc]])
             sqls = [
                 f"CREATE OR REPLACE STORAGE INTEGRATION {sql_ident(integ_name)} TYPE=EXTERNAL_STAGE STORAGE_PROVIDER='S3' ENABLED=TRUE "
                 f"STORAGE_AWS_ROLE_ARN='{role_arn}' "
-                f"STORAGE_ALLOWED_LOCATIONS=({allowed});",
-                f"DESC INTEGRATION {sql_ident(integ_name)};"
+                f"STORAGE_ALLOWED_LOCATIONS=({allowed});"
             ]
+            if include_desc:
+                sqls.append(f"DESC INTEGRATION {sql_ident(integ_name)};")
 
-            stage_names = {"bc": "S3_LZ_BC", "cc": "S3_LZ_CC", "pc": "S3_LZ_PC"}
-            for xc in xcenters:
-                bucket = buckets_map[xc]
-                stage = stage_names[xc]
+            # create stages in ALL three xcenters under ETL_CTRL
+            stage_names = {"BC": "S3_LZ_BC", "CC": "S3_LZ_CC", "PC": "S3_LZ_PC"}
+            per_xc = [
+                (tgt_db_bc, b_bc, stage_names["BC"]),
+                (tgt_db_cc, b_cc, stage_names["CC"]),
+                (tgt_db_pc, b_pc, stage_names["PC"]),
+            ]
+            for db, bucket, stage in per_xc:
                 sqls.append(
-                    f"CREATE STAGE IF NOT EXISTS {sql_ident(target_db)}.{sql_ident(target_schema)}.{sql_ident(stage)} "
+                    f"CREATE STAGE IF NOT EXISTS {sql_ident(db)}.{sql_ident(target_schema)}.{sql_ident(stage)} "
                     f"URL='s3://{bucket}/' STORAGE_INTEGRATION={sql_ident(integ_name)};"
                 )
 
             st.session_state.plan_cloud = [s if s.endswith(";") else s + ";" for s in sqls]
-            st.success(f"Built Integration + {len(xcenters)} stage(s) for {env}. Review below.")
+            st.success(f"Built Integration + 3 stages for {env_upper}. Review below.")
             nice_panel("Integration SQL Plan", "\n".join(st.session_state.plan_cloud))
+
+    if st.session_state.get("plan_cloud"):
+        if st.button("Execute Integration Plan", type="primary", key="cloud_exec_btn"):
+            try:
+                with get_conn() as conn:
+                    cur = conn.cursor()
+                    success, failures = run_multi_sql(cur, st.session_state.plan_cloud)
+                st.session_state.audit = {"success": success, "failures": failures}
+                if failures:
+                    st.warning("Completed with errors. Some steps may need privileged role (e.g., CREATE INTEGRATION requires ACCOUNTADMIN or a delegated role).")
+                else:
+                    st.success("Storage integration and all stages created successfully.")
+            except Exception as e:
+                st.error(f"Execution failed: {e}")
 
     st.markdown("**Terraform apply helper**")
     tf_bullets = []
@@ -534,7 +563,7 @@ with tab_cloud:
         f"terraform -chdir=infra/aws apply \\\n  " + " \\\n  ".join(tf_bullets) + "\n",
         language="bash"
     )
-    st.info("Flow: 1) Apply Terraform with external_id=TEMP → 2) Run the SQL above and execute DESC INTEGRATION → 3) Copy ExternalId value → 4) Re-apply Terraform with that ExternalId.")
+    st.info("Flow: 1) Apply Terraform with external_id=TEMP → 2) Execute Integration Plan here → 3) Copy ExternalId from DESC INTEGRATION → 4) Re-apply Terraform with that ExternalId.")
 
 # -------------------------
 # ETL_CTRL Seeder (environment-aware, with procedure fallback)
@@ -560,6 +589,7 @@ with tab_migrate:
         do_pc   = st.checkbox("Seed PC", value=True, key="seed_do_pc")
 
     destructive   = st.checkbox("CREATE OR REPLACE ETL_CTRL in targets (destructive)", value=False, key="seed_replace")
+    truncate_after_clone = st.checkbox("After destructive clone, TRUNCATE all tables in targets", value=True, key="seed_truncate")
     apply_grants  = st.checkbox("Apply basic grants on target ETL_CTRL (AQS_APP_* roles)", value=True, key="seed_apply_grants")
 
     # Compute targets
@@ -600,16 +630,11 @@ with tab_migrate:
         parts.append(inner[start:].strip())
         types_only = []
         for p in parts:
-            # If there's a space, treat the first token as name, rest as type
-            # e.g. 'LOAD_DETAILS OBJECT', '"MY ARG" NUMBER(38,0)'
             if ' ' in p:
-                # remove repeated spaces
                 name_type = re.sub(r'\s+', ' ', p)
-                # split once (name, type_spec)
                 _, type_spec = name_type.split(' ', 1)
                 types_only.append(type_spec.strip())
             else:
-                # Already a bare type
                 types_only.append(p)
         return "(" + ", ".join(types_only) + ")"
 
@@ -623,16 +648,12 @@ with tab_migrate:
             cur.execute("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))")
             sigs = []
             for row in cur.fetchall():
-                # columns (indexes): 1=name, 6=arguments (types with/without names)
-                # empirically: name match is row[1]; arguments in row[6]
                 proc_name = row[1]
                 args = row[6] or ""
                 if _U(proc_name) != _U(name):
                     continue
-                # args comes as 'VARCHAR, OBJECT' or 'P1 VARCHAR, P2 NUMBER(38,0)' or empty ''
                 args_sig = f"({args})" if args is not None else "()"
                 sigs.append(_normalize_proc_sig(args_sig))
-            # unique preserving order
             seen = set()
             uniq = []
             for s in sigs:
@@ -738,7 +759,7 @@ with tab_migrate:
                 except Exception:
                     src_file_formats = []
 
-                # Procedures: name + signature from INFORMATION_SCHEMA.PROCEDURES (may include param names)
+                # Procedures: name + signature from INFORMATION_SCHEMA.PROCEDURES
                 try:
                     cur.execute(
                         f"""SELECT PROCEDURE_NAME, ARGUMENT_SIGNATURE
@@ -750,16 +771,15 @@ with tab_migrate:
                 except Exception:
                     src_procs_raw = []
 
-                # Preload FILE FORMAT metadata from SHOW (index-based to avoid identifier issues)
+                # Preload FILE FORMAT metadata from SHOW
                 ff_meta: Dict[str, Tuple[str, str]] = {}
                 if src_file_formats:
                     cur.execute(f"SHOW FILE FORMATS IN SCHEMA {sql_ident(src_db)}.{sql_ident(schema_name)}")
                     cur.execute("SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))")
                     for row in cur.fetchall():
-                        # positions: 1=name, 4=type, 7=options
-                        name = row[1]
-                        ftype = row[4]
-                        opts  = row[7] or ""
+                        name = row[1]   # file format name
+                        ftype = row[4]  # type
+                        opts  = row[7] or ""  # options
                         ff_meta[_U(name)] = (ftype, opts)
 
                 # ---- Build plan (idempotent) ----
@@ -781,10 +801,15 @@ with tab_migrate:
 
                     if destructive:
                         plan_seed.append(f"CREATE OR REPLACE SCHEMA {tgt_schema_qual} CLONE {src_schema_qual};")
+                        # Optional: wipe data post-clone
+                        if truncate_after_clone and src_tables:
+                            for t in src_tables:
+                                plan_seed.append(f"TRUNCATE TABLE {tgt_schema_qual}.{sql_ident(t)};")
                     else:
                         plan_seed.append(f"CREATE SCHEMA IF NOT EXISTS {tgt_schema_qual};")
 
-                        # Tables → CLONE
+                        # Tables → CLONE (will copy data). If you need empty tables in this mode,
+                        # replace clone with CREATE TABLE LIKE ...; left as-is since you use destructive.
                         for t in src_tables:
                             plan_seed.append(
                                 f"CREATE OR REPLACE TABLE {tgt_schema_qual}.{sql_ident(t)} "
@@ -848,17 +873,11 @@ with tab_migrate:
                         # -------- Procedures (with signature fallback) --------
                         for name, raw_sig in src_procs_raw:
                             candidates = []
-
-                            # 1) raw signature as-is
                             raw_sig_normed = raw_sig if raw_sig.strip().startswith("(") else f"({raw_sig.strip()})"
                             candidates.append(raw_sig_normed)
-
-                            # 2) types-only normalized signature
                             types_only = _normalize_proc_sig(raw_sig_normed)
                             if types_only not in candidates:
                                 candidates.append(types_only)
-
-                            # 3) from SHOW PROCEDURES
                             for s in _show_proc_signatures(cur, src_db, schema_name, name):
                                 if s not in candidates:
                                     candidates.append(s)
@@ -870,12 +889,11 @@ with tab_migrate:
                                     cur.execute(f"SELECT GET_DDL('PROCEDURE','{fq}', TRUE)")
                                     ddl_obtained = cur.fetchone()[0]
                                     break
-                                except Exception as e:
-                                    # keep trying other candidates
+                                except Exception:
                                     continue
 
                             if not ddl_obtained:
-                                skipped.append(f"PROCEDURE: {_U(src_db)}.{_U(schema_name)}.{_U(name)}  —  GET_DDL failed for all signatures tried: {', '.join(candidates)}")
+                                skipped.append(f"PROCEDURE: {_U(src_db)}.{_U(schema_name)}.{_U(name)}  —  GET_DDL failed for tried signatures: {', '.join(candidates)}")
                                 continue
 
                             ddl = (
@@ -896,8 +914,9 @@ with tab_migrate:
                 st.session_state.plan_seed = plan_seed
                 nice_panel("ETL_CTRL Seeding Plan (resolved)", "\n".join(plan_seed))
                 if skipped:
-                    st.warning("Some objects were skipped (no DDL access or not visible). See details below.")
-                    st.expander("Skipped objects (informational)", expanded=False).write("\n".join(skipped))
+                    st.warning("Some objects were skipped (no DDL access or not visible). Expand to see details.")
+                    with st.expander("Skipped objects (informational)"):
+                        st.code("\n".join(skipped))
                 st.success("Seeding plan built. Review and Execute.")
         except Exception as e:
             st.error(f"Seeding plan build failed: {e}")
