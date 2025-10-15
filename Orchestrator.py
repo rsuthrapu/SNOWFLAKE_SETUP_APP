@@ -8,9 +8,9 @@ from cryptography.hazmat.backends import default_backend
 import pathlib
 import re
 
-# Optional: S3 bucket creation
+# Optional: S3 bucket create/delete
 try:
-    import boto3  # only used if you press the "Create Buckets" button
+    import boto3  # used from the S3 Buckets tab
     from botocore.exceptions import ClientError
     HAS_BOTO3 = True
 except Exception:
@@ -45,7 +45,7 @@ def get_conn():
 
     pk = load_private_key(key_path, key_pass)
     return snowflake.connector.connect(
-        account=account,            # e.g. xy12345.us-east-1
+        account=account,            # e.g. orgname.account
         user=user,
         role=role,
         warehouse=warehouse,
@@ -161,15 +161,13 @@ def mk_warehouse_sql(name: str, opts: Dict[str, Any]) -> str:
         f"SCALING_POLICY = '{policy}';"
     )
 
-# ============
-# UI
-# ============
-st.title("❄️ Snowflake Setup Assistant ")
-st.caption("Create environments; clone & normalize ETL_CTRL per xcenter; build S3 integrations & stages; optional S3 bucket creation.")
+# ============ UI ============
+st.title("❄️ Snowflake Setup Assistant")
+st.caption("Create environments; destructively clone & normalize ETL_CTRL per xcenter; build S3 integrations & stages; optional S3 bucket create/delete.")
 
 with st.sidebar:
     st.header("Connection (Key-pair)")
-    st.session_state.account = st.text_input("Account (e.g. Organization Name.Account Name)", key="sb_account")
+    st.session_state.account = st.text_input("Account (e.g. org.account)", key="sb_account")
     st.session_state.user = st.text_input("Service user", value="CLI_USER", key="sb_user")
     st.session_state.role = st.text_input("Role to execute as", value="CLI_ROLE", key="sb_role")
     st.session_state.warehouse = st.text_input("Warehouse", value="WH_DATA_TEAM", key="sb_wh")
@@ -387,7 +385,7 @@ with tab_env:
                     success, failures = run_multi_sql(cur, st.session_state.plan_env)
                 st.session_state.audit = {"success": success, "failures": failures}
                 if failures:
-                    st.warning("Completed with errors. DDL is auto-committed in Snowflake; some objects may already exist.")
+                    st.warning("Completed with errors. Note: DDL is auto-committed in Snowflake; some objects may already exist.")
                 else:
                     st.success("Environment created successfully.")
             except Exception as e:
@@ -517,8 +515,7 @@ with tab_cloud:
                 sqls.append(
                     f"CREATE OR REPLACE STORAGE INTEGRATION {sql_ident(integ)} TYPE=EXTERNAL_STAGE "
                     f"STORAGE_PROVIDER='S3' ENABLED=TRUE STORAGE_AWS_ROLE_ARN='{role_arn}' "
-                    f"STORAGE_ALLOWED_LOCATIONS=({allowed});",
-
+                    f"STORAGE_ALLOWED_LOCATIONS=({allowed});"
                 )
                 sqls.append(f"DESC INTEGRATION {sql_ident(integ)}; -- copy ExternalId for your IAM trust policy")
 
@@ -602,7 +599,7 @@ with tab_migrate:
     index_token = st.text_input("Index token", value="01", key="seed_index_token")
     integ_name_pat = st.text_input("Integration name pattern (<BASE>_AQS_INT)", value="<BASE>_AQS_INT", key="seed_integ_pat")
 
-    # ---- Signature normalization helpers for procedures (unchanged) ----
+    # ---- Signature normalization helpers (kept for completeness) ----
     def _normalize_proc_sig(sig: str) -> str:
         s = (sig or "").strip()
         if not s.startswith("(") or not s.endswith(")"):
@@ -657,7 +654,7 @@ with tab_migrate:
             with get_conn() as conn:
                 cur = conn.cursor()
 
-                # ---- Discover objects in source (only needed for non-destructive path) ----
+                # ---- Discover a few objects (used mainly for non-destructive) ----
                 cur.execute(
                     f"""SELECT TABLE_NAME
                         FROM {sql_ident(src_db)}.INFORMATION_SCHEMA.TABLES
@@ -718,7 +715,6 @@ with tab_migrate:
                         plan_seed.append(f"CREATE OR REPLACE SCHEMA {tgt_schema_qual} CLONE {src_schema_qual};")
                     else:
                         plan_seed.append(f"CREATE SCHEMA IF NOT EXISTS {tgt_schema_qual};")
-                        # Minimal copy path (not main path now)
                         for t in src_tables:
                             plan_seed.append(
                                 f"CREATE OR REPLACE TABLE {tgt_schema_qual}.{sql_ident(t)} "
@@ -731,7 +727,6 @@ with tab_migrate:
                                 ddl = re.sub(r"\bCREATE\s+VIEW\b", "CREATE OR REPLACE VIEW", ddl, flags=re.I)
                                 plan_seed.append(ddl.rstrip(";") + ";")
 
-                    # Optional: truncate all tables after clone
                     if truncate_after_clone:
                         plan_seed.append(
                             f"BEGIN "
@@ -746,13 +741,11 @@ with tab_migrate:
                     integ = integ_name_pat.replace("<BASE>", base.upper())
                     bucket = bucket_for(org_prefix, env.lower(), mid_tokens, index_token, xc.lower())
 
-                    # 1) rename stages (if present) and set URL + integration
+                    # 1) rename stages + set URL + integration
                     src_stage_manifest = f"{tgt_schema_qual}.STAGE_CC_MANIFEST_DETAILS"
                     new_stage_manifest = f"{tgt_schema_qual}.STAGE_{xc}_MANIFEST_DETAILS"
                     plan_seed.append(f"ALTER STAGE IF EXISTS {src_stage_manifest} RENAME TO STAGE_{xc}_MANIFEST_DETAILS;")
-                    plan_seed.append(
-                        f"CREATE STAGE IF NOT EXISTS {new_stage_manifest};"
-                    )
+                    plan_seed.append(f"CREATE STAGE IF NOT EXISTS {new_stage_manifest};")
                     plan_seed.append(
                         f"ALTER STAGE {new_stage_manifest} "
                         f"SET URL='s3://{bucket}/manifest.json', STORAGE_INTEGRATION={sql_ident(integ)};"
@@ -761,15 +754,13 @@ with tab_migrate:
                     src_stage_stg = f"{tgt_schema_qual}.STAGE_CLAIMS_STG"
                     new_stage_stg = f"{tgt_schema_qual}.STAGE_{xc}_STG"
                     plan_seed.append(f"ALTER STAGE IF EXISTS {src_stage_stg} RENAME TO STAGE_{xc}_STG;")
-                    plan_seed.append(
-                        f"CREATE STAGE IF NOT EXISTS {new_stage_stg};"
-                    )
+                    plan_seed.append(f"CREATE STAGE IF NOT EXISTS {new_stage_stg};")
                     plan_seed.append(
                         f"ALTER STAGE {new_stage_stg} "
                         f"SET URL='s3://{bucket}/', STORAGE_INTEGRATION={sql_ident(integ)};"
                     )
 
-                    # 2) rename / recreate views and rewrite stage references (case-insensitive)
+                    # 2) rename/recreate views and rewrite stage references
                     plan_seed.append(
                         f"""BEGIN
 DECLARE v_old STRING;
@@ -782,17 +773,9 @@ DECLARE c CURSOR FOR
 FOR r IN c DO
   v_old := r.TABLE_NAME;
 
-  -- Full DDL of the source view
   LET ddl STRING := GET_DDL('VIEW','{_U(tgt_db)}.{_U(schema_name)}.'||v_old, TRUE);
-
-  -- Extract the SELECT portion robustly, ignoring case and newlines
   LET sel STRING := REGEXP_SUBSTR(ddl, '(?is)\\bas\\b\\s*(.*)$', 1, 1, 'is', 1);
 
-  -- Replace any of these forms:
-  --   @etl_ctrl.stage_cc_manifest_details
-  --   @"ETL_CTRL"."STAGE_CC_MANIFEST_DETAILS"
-  --   @STAGE_CC_MANIFEST_DETAILS
-  -- with: @ETL_CTRL.STAGE_{xc}_MANIFEST_DETAILS
   LET sel2 STRING := REGEXP_REPLACE(sel,
     '@("?[A-Za-z0-9_]+"?\\.)?"?ETL_CTRL"?\\."?STAGE_CC_MANIFEST_DETAILS"?',
     '@ETL_CTRL.STAGE_{xc}_MANIFEST_DETAILS', 1, 0, 'i');
@@ -811,14 +794,13 @@ END FOR;
 END;"""
                     )
 
-                    # 3) Grants on objects (keep PROD_SYSADMIN as-is)
+                    # 3) Grants on objects (keep existing PROD_SYSADMIN)
                     if apply_grants:
                         plan_seed += [
                             f"GRANT USAGE ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_READER')};",
                             f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_WRITER')};",
                             f"GRANT USAGE, CREATE TABLE, CREATE VIEW, CREATE STAGE, CREATE FILE FORMAT ON SCHEMA {tgt_schema_qual} TO ROLE {sql_ident('AQS_APP_ADMIN')};",
                         ]
-                        # object grants (stages, file formats, procedures)
                         plan_seed += [
                             f"GRANT USAGE ON STAGE {new_stage_manifest} TO ROLE {sql_ident('AQS_APP_READER')};",
                             f"GRANT USAGE ON STAGE {new_stage_manifest} TO ROLE {sql_ident('AQS_APP_WRITER')};",
@@ -851,7 +833,6 @@ END;"""
         except Exception as e:
             st.error(f"Seeding plan build failed: {e}")
 
-    # Execute
     if st.session_state.get("plan_seed"):
         if st.button("Execute Seeding + Normalize Plan", type="primary", key="seed_exec_btn"):
             try:
@@ -1023,39 +1004,74 @@ with tab_delete:
                 st.info("Execution disabled until the confirmation text matches the environment (DEV, QA, or STG).")
 
 # -------------------------
-# Optional: Create S3 landing buckets
+# Optional: Create / Delete S3 landing buckets & files
 # -------------------------
 with tab_buckets:
-    st.subheader("Create S3 Landing Buckets (optional)")
+    st.subheader("Create / Delete S3 Landing Buckets (optional)")
 
     if not HAS_BOTO3:
-        st.warning("boto3 not installed in this environment. Install boto3 to enable bucket creation.")
+        st.warning("boto3 not installed in this environment. Install boto3 to enable S3 operations.")
+
     region = st.text_input("AWS Region", value="us-east-1", key="bkt_region")
     aws_access_key = st.text_input("AWS Access Key ID", value="", key="bkt_key")
     aws_secret_key = st.text_input("AWS Secret Access Key", value="", type="password", key="bkt_secret")
+
     env_b = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="bkt_env")
     org_prefix_b = st.text_input("Org prefix", value="cig", key="bkt_org")
     mid_tokens_b = st.text_input("Middle tokens", value="env-aqs-gw-landing-zone", key="bkt_mid")
     index_token_b = st.text_input("Index token", value="01", key="bkt_idx")
 
-    want_bc_b = st.checkbox("Create BC bucket", value=True, key="bkt_bc")
-    want_cc_b = st.checkbox("Create CC bucket", value=True, key="bkt_cc")
-    want_pc_b = st.checkbox("Create PC bucket", value=True, key="bkt_pc")
+    want_bc_b = st.checkbox("BC", value=True, key="bkt_bc")
+    want_cc_b = st.checkbox("CC", value=True, key="bkt_cc")
+    want_pc_b = st.checkbox("PC", value=True, key="bkt_pc")
 
-    def name_for(xc: str) -> str:
+    # NEW: extra buckets per xcenter via suffixes (comma-separated)
+    extra_suffixes_raw = st.text_input("Extra bucket suffixes (comma-separated, appended as -<suffix>)", value="archive", key="bkt_suffixes")
+    # NEW: optional initial folders to create inside each bucket
+    folders_raw = st.text_input("Create these folders inside each bucket (comma-separated, optional)", value="", key="bkt_folders")
+    # Optional: add fully custom bucket names (comma-separated)
+    extra_full_buckets_raw = st.text_input("Additional full bucket names (comma-separated, optional)", value="", key="bkt_extra_full")
+
+    def base_name_for(xc: str) -> str:
         return f"{org_prefix_b}-{env_b.lower()}-{mid_tokens_b}-{xc}-{index_token_b}-bucket"
 
+    # Build list
+    suffixes = [s.strip() for s in extra_suffixes_raw.split(",") if s.strip()]
+    folders = [f.strip().strip("/").replace("\\", "/") for f in folders_raw.split(",") if f.strip()]
+    buckets: List[str] = []
+
+    selected_xc = []
+    if want_bc_b: selected_xc.append("bc")
+    if want_cc_b: selected_xc.append("cc")
+    if want_pc_b: selected_xc.append("pc")
+
+    for xc in selected_xc:
+        base = base_name_for(xc)
+        buckets.append(base)
+        for suf in suffixes:
+            buckets.append(f"{base}-{suf}")
+
+    # include any extra full names the user typed
+    extra_full = [b.strip() for b in extra_full_buckets_raw.split(",") if b.strip()]
+    buckets.extend(extra_full)
+
+    # Preview unique list (preserve order)
+    seen = set()
     preview = []
-    if want_bc_b: preview.append(name_for("bc"))
-    if want_cc_b: preview.append(name_for("cc"))
-    if want_pc_b: preview.append(name_for("pc"))
+    for b in buckets:
+        if b not in seen:
+            seen.add(b); preview.append(b)
+
     st.code("\n".join(preview) if preview else "—", language="text")
 
-    if st.button("Create Buckets Now", key="bkt_create_btn"):
+    # Create buckets (+folders)
+    if st.button("Create Buckets", key="bkt_create_btn"):
         if not HAS_BOTO3:
             st.error("boto3 is not available here.")
         elif not (aws_access_key and aws_secret_key):
             st.error("Enter AWS Access Key ID and Secret Access Key.")
+        elif not preview:
+            st.error("No bucket names to create.")
         else:
             try:
                 session = boto3.session.Session(
@@ -1074,13 +1090,78 @@ with tab_buckets:
                             s3.create_bucket(Bucket=bn, CreateBucketConfiguration=cfg)
                         created.append(bn)
                     except ClientError as ce:
-                        if ce.response["Error"]["Code"] == "BucketAlreadyOwnedByYou":
+                        code = ce.response.get("Error", {}).get("Code")
+                        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
                             created.append(f"{bn} (already exists)")
                         else:
                             raise
-                st.success("Buckets created / verified:\n" + "\n".join(created))
+                    # create folders as zero-byte keys ending with '/'
+                    for folder in folders:
+                        key = folder.rstrip("/") + "/"
+                        try:
+                            s3.put_object(Bucket=bn, Key=key)
+                        except Exception:
+                            pass
+                st.success("Buckets created / verified:\n" + "\n".join(created) + (("\nFolders created: " + ", ".join(folders)) if folders else ""))
             except Exception as e:
                 st.error(f"Bucket creation failed: {e}")
 
+    st.markdown("---")
+    st.subheader("Delete Files from Buckets (safe cleanup)")
+
+    # NEW: choose specific buckets to clean
+    buckets_for_cleanup = st.multiselect("Select buckets to clean up", options=preview, default=preview, key="bkt_cleanup_select")
+    del_prefix = st.text_input("Prefix to delete (e.g. '', 'manifest.json', 'folder/'). Empty = everything", value="", key="bkt_del_prefix")
+    del_dryrun = st.checkbox("Dry-run (show what would be deleted, do not delete)", value=True, key="bkt_del_dry")
+
+    if st.button("Delete Objects", key="bkt_delete_btn"):
+        if not HAS_BOTO3:
+            st.error("boto3 is not available here.")
+        elif not (aws_access_key and aws_secret_key):
+            st.error("Enter AWS Access Key ID and Secret Access Key.")
+        elif not buckets_for_cleanup:
+            st.error("Choose at least one bucket to clean up.")
+        else:
+            try:
+                session = boto3.session.Session(
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                    region_name=region
+                )
+                s3 = session.client("s3")
+                report = []
+                for bn in buckets_for_cleanup:
+                    deleted_total = 0
+                    listed_total = 0
+                    continuation = None
+                    while True:
+                        kwargs = {"Bucket": bn}
+                        if del_prefix:
+                            kwargs["Prefix"] = del_prefix
+                        if continuation:
+                            kwargs["ContinuationToken"] = continuation
+                        resp = s3.list_objects_v2(**kwargs)
+                        objects = resp.get("Contents", [])
+                        listed_total += len(objects)
+                        if objects and not del_dryrun:
+                            to_delete = [{"Key": o["Key"]} for o in objects]
+                            # delete in batches of <= 1000
+                            for i in range(0, len(to_delete), 1000):
+                                s3.delete_objects(Bucket=bn, Delete={"Objects": to_delete[i:i+1000]})
+                            deleted_total += len(objects)
+                        if not resp.get("IsTruncated"):
+                            break
+                        continuation = resp.get("NextContinuationToken")
+                    if del_dryrun:
+                        report.append(f"{bn}: would match {listed_total} object(s) under prefix '{del_prefix}'")
+                    else:
+                        report.append(f"{bn}: deleted {deleted_total} object(s) under prefix '{del_prefix}'")
+                if del_dryrun:
+                    st.info("\n".join(report))
+                else:
+                    st.success("\n".join(report))
+            except Exception as e:
+                st.error(f"Delete failed: {e}")
+
 st.divider()
-st.caption("Key-pair auth with service user (CLI_USER). Apply least-privilege grants in production. For S3 bucket creation we use AWS Access Key/Secret to call AWS APIs.")
+st.caption("Key-pair auth with service user (CLI_USER). For S3 create/delete we use AWS Access Key/Secret via boto3. Apply least-privilege grants in production.")
