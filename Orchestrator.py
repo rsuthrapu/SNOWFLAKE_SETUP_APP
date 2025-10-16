@@ -7,6 +7,8 @@ from cryptography.hazmat.primitives import serialization as ser
 from cryptography.hazmat.backends import default_backend
 import pathlib
 import re
+import secrets
+import string
 
 # Optional: S3 bucket create/delete
 try:
@@ -161,9 +163,92 @@ def mk_warehouse_sql(name: str, opts: Dict[str, Any]) -> str:
         f"SCALING_POLICY = '{policy}';"
     )
 
+# =========================
+# RBAC / User Access helpers
+# =========================
+def set_role(conn, role_name: Optional[str]):
+    sql = f"SET ROLE {sql_ident(role_name)}" if role_name else "SET ROLE NONE"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+
+def alter_user_defaults(conn, user: str, default_role: Optional[str] = None, secondary_all: bool = False):
+    parts = []
+    if default_role:
+        parts.append(f"DEFAULT_ROLE = {sql_ident(default_role)}")
+    if secondary_all:
+        parts.append("DEFAULT_SECONDARY_ROLES = ('ALL')")
+    if not parts:
+        return
+    with conn.cursor() as cur:
+        cur.execute(f"ALTER USER {sql_ident(user)} SET " + ", ".join(parts))
+
+def grant_role_to_user(conn, role: str, user: str):
+    with conn.cursor() as cur:
+        cur.execute(f"GRANT ROLE {sql_ident(role)} TO USER {sql_ident(user)}")
+
+def revoke_role_from_user(conn, role: str, user: str):
+    with conn.cursor() as cur:
+        cur.execute(f"REVOKE ROLE {sql_ident(role)} FROM USER {sql_ident(user)}")
+
+def list_databases(conn) -> List[str]:
+    with conn.cursor(snowflake.connector.DictCursor) as cur:
+        cur.execute("SHOW DATABASES")
+        return [row["name"] for row in cur.fetchall()]
+
+def show_grants_to_user(conn, user: str) -> List[Dict[str, Any]]:
+    with conn.cursor(snowflake.connector.DictCursor) as cur:
+        cur.execute(f"SHOW GRANTS TO USER {sql_ident(user)}")
+        return cur.fetchall()
+
+def ensure_db_allowlist(conn, user: str, allowed_dbs: set[str], dry_run: bool = True) -> tuple[List[str], List[str]]:
+    """
+    Returns (grants_to_run, revokes_to_run). If dry_run=False, executes them.
+    """
+    with conn.cursor(snowflake.connector.DictCursor) as cur:
+        cur.execute("SHOW DATABASES")
+        all_dbs = {row["name"].upper() for row in cur.fetchall()}
+        allowed = {db.upper() for db in allowed_dbs}
+        to_restrict = all_dbs - allowed
+
+        cur.execute(f"SHOW GRANTS TO USER {sql_ident(user)}")
+        existing = cur.fetchall()
+        existing_db_usage = {
+            (row.get("privilege","").upper(), row.get("granted_on","").upper(), (row.get("name") or "").upper())
+            for row in existing if (row.get("granted_on","").upper() == "DATABASE")
+        }
+
+    grants, revokes = [], []
+    for db in sorted(allowed):
+        if ("USAGE", "DATABASE", db) not in existing_db_usage:
+            grants.append(f"GRANT USAGE ON DATABASE {sql_ident(db)} TO USER {sql_ident(user)}")
+    for db in sorted(to_restrict):
+        if ("USAGE", "DATABASE", db) in existing_db_usage:
+            revokes.append(f"REVOKE USAGE ON DATABASE {sql_ident(db)} FROM USER {sql_ident(user)}")
+
+    if not dry_run:
+        with conn.cursor() as cur:
+            for sql in grants + revokes:
+                cur.execute(sql)
+
+    return grants, revokes
+
+def exec_sqls(conn, statements: List[str]) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    ok, fail = [], []
+    with conn.cursor() as cur:
+        for s in statements:
+            sql = s.strip().rstrip(";")
+            if not sql:
+                continue
+            try:
+                cur.execute(sql)
+                ok.append((sql, "OK"))
+            except Exception as e:
+                fail.append((sql, str(e)))
+    return ok, fail
+
 # ============ UI ============
 st.title("❄️ Snowflake Setup Assistant")
-st.caption("Create environments; destructively clone & normalize ETL_CTRL per xcenter; build S3 integrations & stages; optional S3 bucket create/delete.")
+st.caption("Create environments; destructively clone & normalize ETL_CTRL per xcenter; build S3 integrations & stages; manage user access; optional S3 bucket create/delete.")
 
 with st.sidebar:
     st.header("Connection (Key-pair)")
@@ -175,19 +260,22 @@ with st.sidebar:
     st.session_state.private_key_passphrase = st.text_input("Key passphrase (if set)", type="password", key="sb_pk_pass")
 
 # Tabs
-tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_preview_exec, tab_audit, tab_delete, tab_buckets = st.tabs(
+tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_user_access, tab_users, tab_preview_exec, tab_audit, tab_delete, tab_buckets = st.tabs(
     [
         "Setup Plan",
         "Environment Builder",
         "Warehouses",
         "AWS / S3 Integration",
         "Migrate Objects",
+        "User Access",
+        "Users",               
         "Preview & Execute",
         "Audit / Logs",
         "Delete Environment",
         "S3 Buckets"
     ]
 )
+
 
 # -------------------------
 # Setup Plan (multi-DB)
@@ -415,7 +503,7 @@ with tab_warehouse:
         scaling_policy = st.selectbox("SCALING_POLICY", ["STANDARD", "ECONOMY"], index=0, key="wh_policy")
         comment = st.text_input("COMMENT", value="Small Warehouse to be primarily used for data engineering work", key="wh_comment")
 
-    grant_roles_raw = st.text_input("Grant USAGE to roles (comma-separated)", value="AQS_APP_ADMIN, AQS_APP_WRITER, AQS_APP_READER", key="wh_grant_roles")
+    grant_roles_raw = st.text_input("Grant USAGE to roles (comma-separated)", value="AQS_APP_ADMIN, AQS_APP_READER, AQS_APP_WRITER", key="wh_grant_roles")
     build_wh = st.button("Build Warehouse Plan", key="wh_build_btn")
 
     if build_wh:
@@ -848,6 +936,148 @@ END;"""
                 st.error(f"Execution failed: {e}")
 
 # -------------------------
+# User Access (onrole/offrole, move, restrict DBs, viewer)
+# -------------------------
+with tab_user_access:
+    st.subheader("User Access")
+
+    colu1, colu2 = st.columns([2,1])
+    with colu1:
+        user_input = st.text_input("Target USER (Snowflake identifier)", key="ua_user")
+    with colu2:
+        st.caption("Tip: Use a service user like AQS_SVC_APP for automation.")
+
+    if not user_input:
+        st.info("Enter a user to manage.")
+    else:
+        # --- Session role toggle ---
+        st.markdown("### Session Role")
+        colr1, colr2, colr3 = st.columns([2,1,1])
+        with colr1:
+            role_input = st.text_input("Role to SET in this session (leave blank for OFFROLE)", key="ua_role_set")
+        with colr2:
+            if st.button("OnRole (SET ROLE)", key="ua_btn_onrole"):
+                try:
+                    with get_conn() as conn:
+                        set_role(conn, role_input if role_input.strip() else None)
+                    st.success(f"SET ROLE {role_input or 'NONE'} applied to this session.")
+                except Exception as e:
+                    st.error(f"SET ROLE failed: {e}")
+        with colr3:
+            if st.button("OffRole (SET ROLE NONE)", key="ua_btn_offrole"):
+                try:
+                    with get_conn() as conn:
+                        set_role(conn, None)
+                    st.success("SET ROLE NONE applied to this session.")
+                except Exception as e:
+                    st.error(f"OffRole failed: {e}")
+
+        st.divider()
+
+        # --- Move user between roles ---
+        st.markdown("### Move User Between Roles")
+        c3, c4, c5 = st.columns([2,2,2])
+        with c3:
+            from_role = st.text_input("From role (optional — revoke)", key="ua_from_role")
+        with c4:
+            to_role = st.text_input("To role (grant)", key="ua_to_role")
+        with c5:
+            revoke_old = st.checkbox("Revoke old role", value=True, key="ua_revoke_old")
+        c6, c7 = st.columns([2,2])
+        with c6:
+            set_default = st.checkbox("Set new role as DEFAULT_ROLE", value=True, key="ua_set_default")
+        with c7:
+            secondary_all = st.checkbox("DEFAULT_SECONDARY_ROLES=('ALL')", value=True, key="ua_secondary_all")
+
+        if st.button("Move User", key="ua_move_btn"):
+            try:
+                with get_conn() as conn:
+                    if to_role:
+                        grant_role_to_user(conn, to_role, user_input)
+                    if revoke_old and from_role:
+                        revoke_role_from_user(conn, from_role, user_input)
+                    if set_default and to_role:
+                        alter_user_defaults(conn, user_input, default_role=to_role, secondary_all=secondary_all)
+                msg = f"Granted {to_role} to {user_input}."
+                if revoke_old and from_role:
+                    msg += f" Revoked {from_role}."
+                if set_default and to_role:
+                    msg += f" Set DEFAULT_ROLE={to_role}."
+                st.success(msg)
+            except Exception as e:
+                st.error(f"Move failed: {e}")
+
+        st.divider()
+
+        # --- Restrict to DB allowlist ---
+        st.markdown("### Restrict Access to Selected Databases")
+        try:
+            with get_conn() as conn:
+                dbs = list_databases(conn)
+        except Exception as e:
+            dbs = []
+            st.error(f"Could not list databases: {e}")
+
+        allowed = st.multiselect("Databases allowed for this user", dbs, key="ua_allowed_dbs")
+        dry_run = st.checkbox("Dry run (preview only)", value=True, key="ua_dryrun")
+        if st.button("Apply Restrictions", key="ua_apply_restrict"):
+            if not allowed:
+                st.error("Select at least one allowed database.")
+            else:
+                try:
+                    with get_conn() as conn:
+                        grants, revokes = ensure_db_allowlist(conn, user_input, set(allowed), dry_run=dry_run)
+                    st.write("**Planned GRANTs:**" if dry_run else "**Executed GRANTs:**")
+                    if grants:
+                        for g in grants: st.code(g)
+                    else:
+                        st.caption("No GRANTs needed.")
+                    st.write("**Planned REVOKEs:**" if dry_run else "**Executed REVOKEs:**")
+                    if revokes:
+                        for r in revokes: st.code(r)
+                    else:
+                        st.caption("No REVOKEs needed.")
+                    if not dry_run:
+                        st.success("Database restrictions applied.")
+                except Exception as e:
+                    st.error(f"Restriction failed: {e}")
+
+        st.divider()
+
+        # --- Effective privileges viewer ---
+        st.markdown("### Effective Grants Viewer")
+        if st.button("Refresh Grants", key="ua_refresh_grants"):
+            try:
+                with get_conn() as conn:
+                    grants = show_grants_to_user(conn, user_input)
+                if grants:
+                    with st.expander("Raw SHOW GRANTS TO USER output", expanded=False):
+                        st.json(grants)
+                    # Quick summary
+                    db_usage = [g for g in grants if (g.get("granted_on","").upper()=="DATABASE")]
+                    role_grants = [g for g in grants if g.get("grant_type","").upper()=="ROLE_GRANT"]
+                    st.write(f"Database USAGE entries: {len(db_usage)}")
+                    st.write(f"Role grants (direct/indirect): {len(role_grants)}")
+                else:
+                    st.info("No grants visible for this user.")
+            except Exception as e:
+                st.error(f"Show grants failed: {e}")
+
+        # --- Optional: generate auto-revoke helper SQL (copy only) ---
+        with st.expander("Generate auto-revoke helper (copy-only)", expanded=False):
+            target_role = st.text_input("Role to grant temporarily", key="ua_temp_role")
+            minutes = st.number_input("Minutes until revoke", min_value=5, max_value=1440, value=60, step=5, key="ua_temp_minutes")
+            if st.button("Generate SQL", key="ua_temp_gen"):
+                task_name = f"T_AUTO_REVOKE_{_U(user_input)}_{_U(target_role)}"
+                sqls = [
+                    f"GRANT ROLE {sql_ident(target_role)} TO USER {sql_ident(user_input)};",
+                    f"CREATE OR REPLACE TASK {sql_ident(task_name)} SCHEDULE = 'USING CRON */{minutes} * * * * UTC' COMMENT='Auto-revoke role grant' AS REVOKE ROLE {sql_ident(target_role)} FROM USER {sql_ident(user_input)};",
+                    f"ALTER TASK {sql_ident(task_name)} RESUME;"
+                ]
+                st.code("\n".join(sqls), language="sql")
+                st.caption("Note: Adjust schedule as needed; this is a copy-only helper.")
+
+# -------------------------
 # Preview & Execute
 # -------------------------
 with tab_preview_exec:
@@ -1025,9 +1255,9 @@ with tab_buckets:
     want_cc_b = st.checkbox("CC", value=True, key="bkt_cc")
     want_pc_b = st.checkbox("PC", value=True, key="bkt_pc")
 
-    # NEW: extra buckets per xcenter via suffixes (comma-separated)
+    # Extra buckets per xcenter via suffixes (comma-separated)
     extra_suffixes_raw = st.text_input("Extra bucket suffixes (comma-separated, appended as -<suffix>)", value="archive", key="bkt_suffixes")
-    # NEW: optional initial folders to create inside each bucket
+    # Optional initial folders to create inside each bucket
     folders_raw = st.text_input("Create these folders inside each bucket (comma-separated, optional)", value="", key="bkt_folders")
     # Optional: add fully custom bucket names (comma-separated)
     extra_full_buckets_raw = st.text_input("Additional full bucket names (comma-separated, optional)", value="", key="bkt_extra_full")
@@ -1109,7 +1339,7 @@ with tab_buckets:
     st.markdown("---")
     st.subheader("Delete Files from Buckets (safe cleanup)")
 
-    # NEW: choose specific buckets to clean
+    # choose specific buckets to clean
     buckets_for_cleanup = st.multiselect("Select buckets to clean up", options=preview, default=preview, key="bkt_cleanup_select")
     del_prefix = st.text_input("Prefix to delete (e.g. '', 'manifest.json', 'folder/'). Empty = everything", value="", key="bkt_del_prefix")
     del_dryrun = st.checkbox("Dry-run (show what would be deleted, do not delete)", value=True, key="bkt_del_dry")
@@ -1162,6 +1392,218 @@ with tab_buckets:
                     st.success("\n".join(report))
             except Exception as e:
                 st.error(f"Delete failed: {e}")
+
+
+# ==== Users helpers ====
+
+def _gen_temp_password(length: int = 20) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    # ensure at least one of each class
+    pwd = [
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.digits),
+        secrets.choice("!@#$%^&*()-_=+"),
+    ] + [secrets.choice(alphabet) for _ in range(length - 4)]
+    secrets.SystemRandom().shuffle(pwd)
+    return "".join(pwd)
+
+def create_or_update_user_simple(
+    conn,
+    user: str,
+    *,
+    login_name: Optional[str] = None,
+    display_name: Optional[str] = None,
+    email: Optional[str] = None,
+    default_role: Optional[str] = None,
+    default_wh: Optional[str] = None,
+    default_db: Optional[str] = None,
+    default_schema: Optional[str] = None,
+    network_policy: Optional[str] = None,
+    disabled: bool = False,
+    auth_mode: str = "SSO",  # "SSO" | "TEMP_PASSWORD" | "RSA"
+    rsa_public_key: Optional[str] = None,
+    temp_password: Optional[str] = None,
+    must_change_password: bool = True,
+) -> Optional[str]:
+    """
+    Returns the generated temporary password if auth_mode='TEMP_PASSWORD' and we generated one.
+    """
+    ident_user = sql_ident(user)
+    props = []
+    if login_name:      props.append(f"LOGIN_NAME = '{login_name}'")
+    if display_name:    props.append(f"DISPLAY_NAME = '{display_name}'")
+    if email:           props.append(f"EMAIL = '{email}'")
+    if default_role:    props.append(f"DEFAULT_ROLE = {sql_ident(default_role)}")
+    if default_wh:      props.append(f"DEFAULT_WAREHOUSE = {sql_ident(default_wh)}")
+    if default_db and default_schema:
+        props.append(f"DEFAULT_NAMESPACE = {sql_ident(default_db)}.{sql_ident(default_schema)}")
+    if network_policy:  props.append(f"NETWORK_POLICY = {sql_ident(network_policy)}")
+    props.append(f"DISABLED = {'TRUE' if disabled else 'FALSE'}")
+
+    # Auth handling
+    generated_pwd = None
+    if auth_mode == "TEMP_PASSWORD":
+        if not temp_password:
+            generated_pwd = _gen_temp_password()
+            pwd = generated_pwd
+        else:
+            pwd = temp_password
+        props.append(f"PASSWORD = '{pwd}'")
+        props.append(f"MUST_CHANGE_PASSWORD = {'TRUE' if must_change_password else 'FALSE'}")
+    elif auth_mode == "RSA":
+        if rsa_public_key:
+            props.append(f"RSA_PUBLIC_KEY = '{rsa_public_key.strip()}'")
+        else:
+            raise ValueError("RSA auth selected but no RSA public key provided.")
+    else:
+        # SSO/no credentials -> do nothing; user will sign in via IdP.
+        pass
+
+    with conn.cursor() as cur:
+        # Try CREATE, fallback to ALTER (Snowflake USER lacks IF NOT EXISTS)
+        try:
+            cur.execute(f"CREATE USER {ident_user} " + " ".join(props))
+        except Exception:
+            cur.execute(f"ALTER USER {ident_user} SET " + ", ".join(props))
+
+    return generated_pwd
+
+def grant_roles_to_user(conn, roles: list[str], user: str):
+    with conn.cursor() as cur:
+        for r in roles:
+            cur.execute(f"GRANT ROLE {sql_ident(r)} TO USER {sql_ident(user)}")
+
+def grant_schema_usage_current_and_future(conn, user: str, dbs: list[str]):
+    """
+    Grants USAGE on ALL existing and FUTURE schemas in each DB directly to the user.
+    """
+    stmts = []
+    for db in dbs:
+        dbi = sql_ident(db)
+        stmts.append(f"GRANT USAGE ON ALL SCHEMAS IN DATABASE {dbi} TO USER {sql_ident(user)}")
+        stmts.append(f"GRANT USAGE ON FUTURE SCHEMAS IN DATABASE {dbi} TO USER {sql_ident(user)}")
+    ok, fail = exec_sqls(conn, stmts)
+    return ok, fail
+
+
+# -------------------------
+# Users (create/update)
+# -------------------------
+with tab_users:
+    st.subheader("Users")
+
+    # Identity basics
+    c1, c2 = st.columns([2,1])
+    with c1:
+        user_name = st.text_input("User name (Snowflake identifier)", key="usr_name")
+        login_name = st.text_input("LOGIN_NAME (optional)", key="usr_login")
+        display_name = st.text_input("DISPLAY_NAME (optional)", key="usr_display")
+        email = st.text_input("EMAIL (optional)", key="usr_email")
+    with c2:
+        disabled = st.checkbox("Disabled", value=False, key="usr_disabled")
+        network_policy = st.text_input("NETWORK_POLICY (optional)", key="usr_np")
+
+    # Defaults
+    st.markdown("**Defaults**")
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        default_role = st.text_input("DEFAULT_ROLE", value="AQS_APP_READER", key="usr_def_role")
+    with c4:
+        default_wh = st.text_input("DEFAULT_WAREHOUSE", value="WH_DATA_TEAM", key="usr_def_wh")
+    with c5:
+        default_db = st.text_input("DEFAULT_DB (for DEFAULT_NAMESPACE)", value="", key="usr_def_db")
+    default_schema = st.text_input("DEFAULT_SCHEMA (for DEFAULT_NAMESPACE)", value="", key="usr_def_schema")
+
+    # Auth style selector
+    st.markdown("**Authentication**")
+    auth_mode = st.radio(
+        "Choose how this user authenticates",
+        ["SSO (no password here)", "Temp password (must change)", "RSA public key (service user)"],
+        horizontal=True,
+        key="usr_auth_mode"
+    )
+    auth_key = {"SSO (no password here)": "SSO", "Temp password (must change)": "TEMP_PASSWORD", "RSA public key (service user)": "RSA"}[auth_mode]
+
+    rsa_pub = None
+    temp_password = None
+    must_change = True
+
+    if auth_key == "TEMP_PASSWORD":
+        colp1, colp2 = st.columns([3,1])
+        with colp1:
+            temp_password = st.text_input("Set initial password (leave blank to auto-generate)", type="password", key="usr_temp_pwd")
+        with colp2:
+            must_change = st.checkbox("MUST_CHANGE_PASSWORD", value=True, key="usr_must_change")
+        st.caption("Tip: Leave blank to have the app generate a strong one-time password and show it once.")
+    elif auth_key == "RSA":
+        rsa_pub = st.text_area("Paste RSA PUBLIC KEY (PEM body only)", height=120, key="usr_rsa")
+        st.caption("Use for service users (key-pair auth). Normal org users typically use SSO or passwords.")
+
+    # Role grants
+    st.markdown("**Grant roles after create/update**")
+    roles_to_grant = st.text_input("Roles to grant (comma-separated)", value="AQS_APP_READER", key="usr_roles")
+
+    # DB allowlist + schema usage
+    st.markdown("**Database access (allowlist)**")
+    try:
+        with get_conn() as conn:
+            all_dbs = list_databases(conn)
+    except Exception as e:
+        all_dbs = []
+        st.error(f"Could not list databases: {e}")
+
+    allowed_dbs = st.multiselect("Databases to allow (grants USAGE on these; revokes from others)", all_dbs, key="usr_allowed_dbs")
+    grant_schema_usage = st.checkbox("Also grant USAGE on ALL current & FUTURE schemas for the allowed DBs", value=True, key="usr_schema_usage")
+
+    # Action
+    do_create = st.button("Create / Update User", type="primary", key="usr_do")
+    if do_create:
+        if not user_name:
+            st.error("User name is required.")
+        else:
+            try:
+                with get_conn() as conn:
+                    # Create / update user with chosen auth mode
+                    generated = create_or_update_user_simple(
+                        conn,
+                        user=user_name,
+                        login_name=login_name or None,
+                        display_name=display_name or None,
+                        email=email or None,
+                        default_role=default_role or None,
+                        default_wh=default_wh or None,
+                        default_db=default_db or None,
+                        default_schema=default_schema or None,
+                        network_policy=network_policy or None,
+                        disabled=disabled,
+                        auth_mode=auth_key,
+                        rsa_public_key=(rsa_pub or None),
+                        temp_password=(temp_password or None),
+                        must_change_password=must_change,
+                    )
+
+                    # Role grants
+                    roles = [r.strip() for r in roles_to_grant.split(",") if r.strip()]
+                    if roles:
+                        grant_roles_to_user(conn, roles, user_name)
+
+                    # DB allowlist with optional schema usage grants
+                    if allowed_dbs:
+                        # first, align DB USAGE exactly to the allowlist
+                        grants, revokes = ensure_db_allowlist(conn, user_name, set(allowed_dbs), dry_run=False)
+                        # then, optionally grant schema usage (current + future)
+                        if grant_schema_usage:
+                            ok, fail = grant_schema_usage_current_and_future(conn, user_name, allowed_dbs)
+                    st.success(f"User {user_name} created/updated; roles and DB access applied.")
+
+                    # Show the generated password exactly once if we created it
+                    if generated:
+                        st.warning("Copy the temporary password now; it won't be shown again in this app session.")
+                        st.code(generated)
+            except Exception as e:
+                st.error(f"User create/update failed: {e}")
+
 
 st.divider()
 st.caption("Key-pair auth with service user (CLI_USER). For S3 create/delete we use AWS Access Key/Secret via boto3. Apply least-privilege grants in production.")
