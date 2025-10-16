@@ -167,9 +167,26 @@ def mk_warehouse_sql(name: str, opts: Dict[str, Any]) -> str:
 # RBAC / User Access helpers
 # =========================
 def set_role(conn, role_name: Optional[str]):
-    sql = f"SET ROLE {sql_ident(role_name)}" if role_name else "SET ROLE NONE"
+    """
+    Switch the current role. If blank/None/'NONE', fall back to PUBLIC.
+    """
+    desired = (role_name or "").strip().upper()
+    if desired and desired not in ("NONE", "OFF", "OFFROLE", "PUBLIC"):
+        sql = f"USE ROLE {sql_ident(desired)}"
+    else:
+        sql = "USE ROLE PUBLIC"
     with conn.cursor() as cur:
         cur.execute(sql)
+
+def set_secondary_roles(conn, mode: str):
+    """
+    Enable/disable secondary roles: mode should be 'ALL' or 'NONE'.
+    """
+    mode_up = (mode or "").strip().upper()
+    if mode_up not in ("ALL", "NONE"):
+        raise ValueError("mode must be 'ALL' or 'NONE'")
+    with conn.cursor() as cur:
+        cur.execute(f"SET SECONDARY ROLES {mode_up}")        
 
 def alter_user_defaults(conn, user: str, default_role: Optional[str] = None, secondary_all: bool = False):
     parts = []
@@ -260,7 +277,7 @@ with st.sidebar:
     st.session_state.private_key_passphrase = st.text_input("Key passphrase (if set)", type="password", key="sb_pk_pass")
 
 # Tabs
-tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_user_access, tab_users, tab_preview_exec, tab_audit, tab_delete, tab_buckets = st.tabs(
+tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_user_access, tab_users, tab_preview_exec, tab_audit, tab_ownership, tab_delete, tab_buckets = st.tabs(
     [
         "Setup Plan",
         "Environment Builder",
@@ -268,14 +285,14 @@ tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_user_access, tab_
         "AWS / S3 Integration",
         "Migrate Objects",
         "User Access",
-        "Users",               
+        "Users",
         "Preview & Execute",
         "Audit / Logs",
+        "Ownership Handoff",   
         "Delete Environment",
         "S3 Buckets"
     ]
 )
-
 
 # -------------------------
 # Setup Plan (multi-DB)
@@ -1173,6 +1190,12 @@ with tab_delete:
     st.markdown("**Warehouses**")
     drop_wh = st.checkbox("Drop warehouses for selected xcenters", value=True, key="del_drop_wh")
 
+    st.divider()
+
+    # NEW: execution role + neutral DB option
+    exec_role_for_drop = st.text_input("Execution role for DROP", value="PROD_SYSADMIN", key="del_exec_role")
+    also_use_neutral_db = st.checkbox("Switch to neutral database before dropping (recommended)", value=True, key="del_use_neutral_db")
+
     confirm_text = st.text_input("Type the environment name to confirm (DEV, QA, or STG)", key="del_confirm_text")
 
     if st.button("Build DROP Plan", key="del_build_btn"):
@@ -1218,8 +1241,22 @@ with tab_delete:
             if st.button("Execute DROP Plan (Irreversible)", type="primary", key="del_exec_btn"):
                 try:
                     with get_conn() as conn:
+                        # Switch to the role that owns the objects (e.g., PROD_SYSADMIN)
+                        try:
+                            set_role(conn, exec_role_for_drop)
+                        except Exception as e:
+                            st.error(f"Could not switch to role {exec_role_for_drop}: {e}")
+                            raise
+
+                        # Optional: move to a neutral DB to avoid “in-use” issues when dropping target DBs
+                        if also_use_neutral_db:
+                            with conn.cursor() as cur:
+                                # SNOWFLAKE database is always present
+                                cur.execute("USE DATABASE SNOWFLAKE")
+
                         cur = conn.cursor()
                         success, failures = run_multi_sql(cur, st.session_state.plan_drop)
+
                     st.session_state.audit = {"success": success, "failures": failures}
                     if failures:
                         st.warning("Completed with errors. DDL is auto-committed; some actions may already have applied.")
@@ -1393,7 +1430,6 @@ with tab_buckets:
             except Exception as e:
                 st.error(f"Delete failed: {e}")
 
-
 # ==== Users helpers ====
 
 def _gen_temp_password(length: int = 20) -> str:
@@ -1486,6 +1522,361 @@ def grant_schema_usage_current_and_future(conn, user: str, dbs: list[str]):
     ok, fail = exec_sqls(conn, stmts)
     return ok, fail
 
+# ===== Ownership transfer helpers =====
+def build_transfer_ownership_sql(db_name: str, new_owner_role: str = "PROD_SYSADMIN") -> List[str]:
+    """
+    Recursively transfer OWNERSHIP of a DB, its schemas, and common object types to new_owner_role,
+    preserving other grants via COPY CURRENT GRANTS. Must be executed BY THE CURRENT OWNER.
+    """
+    dbi = sql_ident(db_name)
+    ri  = sql_ident(new_owner_role)
+    stmts: List[str] = []
+
+    # 0) Database
+    stmts.append(f"GRANT OWNERSHIP ON DATABASE {dbi} TO ROLE {ri} COPY CURRENT GRANTS;")
+
+    # 1) Schemas
+    stmts.append(f"""
+BEGIN
+  FOR r IN (SELECT SCHEMA_NAME FROM {dbi}.INFORMATION_SCHEMA.SCHEMATA)
+  DO
+    EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON SCHEMA {dbi}.'||quote_ident(r.SCHEMA_NAME)||' TO ROLE {ri} COPY CURRENT GRANTS';
+  END FOR;
+END;""".strip())
+
+    # 2) Tables / Views / Sequences
+    for objtype, is_view in [("TABLES", False), ("VIEWS", True), ("SEQUENCES", False)]:
+        stmts.append(f"""
+BEGIN
+  FOR s IN (SELECT SCHEMA_NAME FROM {dbi}.INFORMATION_SCHEMA.SCHEMATA)
+  DO
+    FOR o IN (
+      SELECT {"TABLE_NAME" if objtype!='SEQUENCES' else "SEQUENCE_NAME"} AS NAME
+      FROM {dbi}.INFORMATION_SCHEMA.{objtype}
+      WHERE TABLE_SCHEMA = s.SCHEMA_NAME
+    )
+    DO
+      EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON {"VIEW" if is_view else ("SEQUENCE" if objtype=="SEQUENCES" else "TABLE")} {dbi}.'||
+                         quote_ident(s.SCHEMA_NAME)||'.'||quote_ident(o.NAME)||
+                         ' TO ROLE {ri} COPY CURRENT GRANTS';
+    END FOR;
+  END FOR;
+END;""".strip())
+
+    # 3) Stages / File Formats / Tasks / Pipes / Streams
+    for obj, kw in [("STAGES","STAGE"), ("FILE FORMATS","FILE FORMAT"), ("TASKS","TASK"), ("PIPES","PIPE"), ("STREAMS","STREAM")]:
+        stmts.append(f"""
+BEGIN
+  FOR s IN (SELECT SCHEMA_NAME FROM {dbi}.INFORMATION_SCHEMA.SCHEMATA)
+  DO
+    EXECUTE IMMEDIATE 'SHOW {obj} IN SCHEMA {dbi}.'||quote_ident(s.SCHEMA_NAME);
+    FOR r IN (SELECT "name" AS NAME FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())))
+    DO
+      EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON {kw} {dbi}.'||
+                         quote_ident(s.SCHEMA_NAME)||'.'||quote_ident(r.NAME)||
+                         ' TO ROLE {ri} COPY CURRENT GRANTS';
+    END FOR;
+  END FOR;
+END;""".strip())
+
+    # 4) Procedures / Functions (need signatures)
+    for obj, col_name in [("PROCEDURES","PROCEDURE_NAME"), ("FUNCTIONS","FUNCTION_NAME")]:
+        stmts.append(f"""
+BEGIN
+  FOR s IN (SELECT SCHEMA_NAME FROM {dbi}.INFORMATION_SCHEMA.SCHEMATA)
+  DO
+    FOR r IN (
+      SELECT {col_name} AS NAME, COALESCE(ARGUMENT_SIGNATURE,'()') AS SIG
+      FROM {dbi}.INFORMATION_SCHEMA.{obj}
+      WHERE {"PROCEDURE" if obj=="PROCEDURES" else "FUNCTION"}_SCHEMA = s.SCHEMA_NAME
+    )
+    DO
+      EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON {"PROCEDURE" if obj=="PROCEDURES" else "FUNCTION"} {dbi}.'||
+                         quote_ident(s.SCHEMA_NAME)||'.'||r.NAME||r.SIG||
+                         ' TO ROLE {ri} COPY CURRENT GRANTS';
+    END FOR;
+  END FOR;
+END;""".strip())
+
+    return stmts
+
+def build_etl_ctrl_handoff_sql(db_name: str, new_owner_role: str = "PROD_SYSADMIN") -> List[str]:
+    """
+    ETL_CTRL schema-only handoff for <DB>.ETL_CTRL and all contained objects.
+    """
+    return _build_single_schema_handoff_sql(db_name, "ETL_CTRL", new_owner_role)
+
+def _build_single_schema_handoff_sql(db_name: str, schema: str, new_owner_role: str) -> List[str]:
+    """Generic version of schema handoff for arbitrary schema names."""
+    dbi = sql_ident(db_name)
+    sci = sql_ident(schema)
+    ri  = sql_ident(new_owner_role)
+    schema_qual = f"{dbi}.{sci}"
+    stmts: List[str] = []
+    stmts.append(f"GRANT OWNERSHIP ON SCHEMA {schema_qual} TO ROLE {ri} COPY CURRENT GRANTS;")
+    # tables / views / sequences
+    stmts.append(f"""
+BEGIN
+  FOR r IN (SELECT TABLE_NAME FROM {dbi}.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='{_U(schema)}' AND TABLE_TYPE='BASE TABLE')
+  DO
+    EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON TABLE {schema_qual}.'||quote_ident(r.TABLE_NAME)||' TO ROLE {ri} COPY CURRENT GRANTS';
+  END FOR;
+  FOR r IN (SELECT TABLE_NAME FROM {dbi}.INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA='{_U(schema)}')
+  DO
+    EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON VIEW {schema_qual}.'||quote_ident(r.TABLE_NAME)||' TO ROLE {ri} COPY CURRENT GRANTS';
+  END FOR;
+  FOR r IN (SELECT SEQUENCE_NAME FROM {dbi}.INFORMATION_SCHEMA.SEQUENCES WHERE SEQUENCE_SCHEMA='{_U(schema)}')
+  DO
+    EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON SEQUENCE {schema_qual}.'||quote_ident(r.SEQUENCE_NAME)||' TO ROLE {ri} COPY CURRENT GRANTS';
+  END FOR;
+END;""".strip())
+    # stages / file formats / tasks / pipes / streams
+    for obj, kw in [("STAGES","STAGE"), ("FILE FORMATS","FILE FORMAT"), ("TASKS","TASK"), ("PIPES","PIPE"), ("STREAMS","STREAM")]:
+        stmts.append(f"""
+BEGIN
+  EXECUTE IMMEDIATE 'SHOW {obj} IN SCHEMA {schema_qual}';
+  FOR r IN (SELECT "name" AS NAME FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())))
+  DO
+    EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON {kw} {schema_qual}.'||quote_ident(r.NAME)||' TO ROLE {ri} COPY CURRENT GRANTS';
+  END FOR;
+END;""".strip())
+    # procedures / functions
+    stmts.append(f"""
+BEGIN
+  FOR r IN (
+    SELECT PROCEDURE_NAME AS NAME, COALESCE(ARGUMENT_SIGNATURE,'()') AS SIG
+    FROM {dbi}.INFORMATION_SCHEMA.PROCEDURES
+    WHERE PROCEDURE_SCHEMA='{_U(schema)}'
+  )
+  DO
+    EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON PROCEDURE {schema_qual}.'||r.NAME||r.SIG||' TO ROLE {ri} COPY CURRENT GRANTS';
+  END FOR;
+  FOR r IN (
+    SELECT FUNCTION_NAME AS NAME, COALESCE(ARGUMENT_SIGNATURE,'()') AS SIG
+    FROM {dbi}.INFORMATION_SCHEMA.FUNCTIONS
+    WHERE FUNCTION_SCHEMA='{_U(schema)}'
+  )
+  DO
+    EXECUTE IMMEDIATE 'GRANT OWNERSHIP ON FUNCTION {schema_qual}.'||r.NAME||r.SIG||' TO ROLE {ri} COPY CURRENT GRANTS';
+  END FOR;
+END;""".strip())
+    return stmts
+
+# -------------------------
+# Ownership Handoff
+# -------------------------
+with tab_ownership:
+    st.subheader("Ownership Handoff (DB-wide or single schema)")
+
+    # ---- Scope selection
+    scope = st.radio(
+        "Scope",
+        ["Database (DB → schemas → objects)", "Single schema (default: ETL_CTRL)"],
+        horizontal=True,
+        key="own_scope_mode"
+    )
+
+    col0a, col0b = st.columns([2,1])
+    with col0a:
+        db_name = st.text_input("Database name", key="own_db_name")
+    with col0b:
+        target_role = st.text_input("New owner role", value="PROD_SYSADMIN", key="own_target_role")
+
+    # Single-schema options
+    schema_name = "ETL_CTRL"
+    if scope.startswith("Single"):
+        schema_name = st.text_input("Schema name", value="ETL_CTRL", key="own_schema_name")
+
+    st.caption("Run as the **current owner** of the target object(s). `COPY CURRENT GRANTS` is used to preserve other privileges.")
+
+    # ---- Optional role switch helpers
+    st.markdown("**Temporarily switch session role (optional)**")
+    colr1, colr2 = st.columns([1.2,1])
+    with colr1:
+        exec_role = st.text_input("SET ROLE (leave blank for NONE)", value="", key="own_exec_role")
+    with colr2:
+        cbtn1, cbtn2 = st.columns(2)
+        with cbtn1:
+            if st.button("SET ROLE", key="own_btn_setrole"):
+                try:
+                    with get_conn() as conn:
+                        set_role(conn, exec_role.strip() or None)
+                    st.success(f"SET ROLE {exec_role or 'NONE'} applied.")
+                except Exception as e:
+                    st.error(f"SET ROLE failed: {e}")
+        with cbtn2:
+            if st.button("SET ROLE NONE", key="own_btn_roff"):
+                try:
+                    with get_conn() as conn:
+                        set_role(conn, None)
+                    st.success("SET ROLE NONE applied.")
+                except Exception as e:
+                    st.error(f"SET ROLE NONE failed: {e}")
+
+    st.divider()
+
+    # ---- Build / Execute
+    colA, colB, colC = st.columns([1.3,1,1])
+    with colA:
+        if st.button("Build Ownership Transfer SQL", key="own_build_plan"):
+            if not db_name or not target_role:
+                st.error("Enter both Database and New owner role.")
+            else:
+                if scope.startswith("Database"):
+                    # DB-wide plan
+                    stmts = build_transfer_ownership_sql(db_name, target_role)
+                else:
+                    # Single schema plan (defaults to ETL_CTRL)
+                    stmts = build_etl_ctrl_handoff_sql(db_name, target_role) if schema_name.upper() == "ETL_CTRL" \
+                        else _build_single_schema_handoff_sql(db_name, schema_name, target_role)
+                st.session_state.plan_ownership_unified = stmts
+                nice_panel("Ownership Transfer Plan", "\n".join(stmts))
+
+    with colB:
+        if st.button("Execute Handoff", key="own_exec_plan"):
+            plan = st.session_state.get("plan_ownership_unified")
+            if not plan:
+                st.error("Build the plan first.")
+            else:
+                try:
+                    with get_conn() as conn:
+                        # IMPORTANT: apply requested SET ROLE in the same connection used to execute
+                        if exec_role is not None:
+                            set_role(conn, exec_role.strip() or None)
+                        cur = conn.cursor()
+                        success, failures = run_multi_sql(cur, plan)
+                    st.session_state.audit = {"success": success, "failures": failures}
+                    if failures:
+                        st.warning("Completed with errors. Some statements likely failed because a different role owns some objects. See Audit.")
+                    else:
+                        target_label = f"{db_name}" if scope.startswith("Database") else f"{db_name}.{schema_name}"
+                        st.success(f"Ownership of {target_label} (and contained objects) transferred to {target_role}.")
+                except Exception as e:
+                    st.error(f"Execution failed: {e}")
+
+    with colC:
+        if st.button("Clear Plan", key="own_clear_plan"):
+            st.session_state.pop("plan_ownership_unified", None)
+            st.info("Cleared.")
+
+    st.divider()
+    st.markdown("### Diagnostics")
+
+    colD, colE = st.columns(2)
+    with colD:
+        st.markdown("**Current role & its grants**")
+        if st.button("Show CURRENT_ROLE and grants", key="own_diag_role"):
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT CURRENT_ROLE()")
+                        role = cur.fetchone()[0]
+                    with conn.cursor(snowflake.connector.DictCursor) as cur:
+                        cur.execute(f"SHOW GRANTS TO ROLE {sql_ident(role)}")
+                        rows = cur.fetchall()
+                    st.write(f"CURRENT_ROLE: `{role}`")
+                    st.json(rows)
+            except Exception as e:
+                st.error(f"Check failed: {e}")
+
+    with colE:
+        if scope.startswith("Database"):
+            st.markdown("**Who owns schemas & sample objects (DB scope)**")
+            if st.button("Inspect DB", key="own_diag_db"):
+                if not db_name:
+                    st.error("Enter database.")
+                else:
+                    try:
+                        with get_conn() as conn:
+                            with conn.cursor(snowflake.connector.DictCursor) as cur:
+                                cur.execute(f"SHOW SCHEMAS IN DATABASE {sql_ident(db_name)}")
+                                st.caption("Schemas:")
+                                st.json(cur.fetchall())
+                                # quick peek at ETL_CTRL if present
+                                cur.execute(f"SHOW SCHEMAS LIKE 'ETL_CTRL' IN DATABASE {sql_ident(db_name)}")
+                                rows = cur.fetchall()
+                                if rows:
+                                    st.caption("ETL_CTRL — grants:")
+                                    cur.execute(f"SHOW GRANTS ON SCHEMA {sql_ident(db_name)}.ETL_CTRL")
+                                    st.json(cur.fetchall())
+                    except Exception as e:
+                        st.error(f"Check failed: {e}")
+        else:
+            st.markdown("**Who owns schema & objects (Schema scope)**")
+            if st.button("Inspect Schema", key="own_diag_schema"):
+                if not db_name or not schema_name:
+                    st.error("Enter database and schema.")
+                else:
+                    try:
+                        with get_conn() as conn:
+                            with conn.cursor(snowflake.connector.DictCursor) as cur:
+                                cur.execute(f"SHOW SCHEMAS LIKE '{_U(schema_name)}' IN DATABASE {sql_ident(db_name)}")
+                                st.caption("Schema row(s):")
+                                st.json(cur.fetchall())
+                                cur.execute(f"SHOW GRANTS ON SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}")
+                                st.caption("Grants on schema:")
+                                st.json(cur.fetchall())
+                                # Objects (owners)
+                                out = {}
+                                for show_sql, label in [
+                                    (f"SHOW TABLES IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "TABLES"),
+                                    (f"SHOW VIEWS IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "VIEWS"),
+                                    (f"SHOW STAGES IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "STAGES"),
+                                    (f"SHOW FILE FORMATS IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "FILE_FORMATS"),
+                                    (f"SHOW SEQUENCES IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "SEQUENCES"),
+                                    (f"SHOW TASKS IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "TASKS"),
+                                    (f"SHOW PIPES IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "PIPES"),
+                                    (f"SHOW STREAMS IN SCHEMA {sql_ident(db_name)}.{sql_ident(schema_name)}", "STREAMS"),
+                                ]:
+                                    cur.execute(show_sql)
+                                    rows = cur.fetchall()
+                                    owners = sorted({(r.get("name"), r.get("owner")) for r in rows}) if rows else []
+                                    out[label] = owners
+                                # Procedures / Functions via INFORMATION_SCHEMA (signature/created_by visibility)
+                                cur.execute(f"""
+                                    SELECT PROCEDURE_NAME AS name, COALESCE(ARGUMENT_SIGNATURE,'()') AS sig
+                                    FROM {sql_ident(db_name)}.INFORMATION_SCHEMA.PROCEDURES
+                                    WHERE PROCEDURE_SCHEMA='{_U(schema_name)}'
+                                """)
+                                out["PROCEDURES"] = [tuple(r) for r in cur.fetchall()]
+                                cur.execute(f"""
+                                    SELECT FUNCTION_NAME AS name, COALESCE(ARGUMENT_SIGNATURE,'()') AS sig
+                                    FROM {sql_ident(db_name)}.INFORMATION_SCHEMA.FUNCTIONS
+                                    WHERE FUNCTION_SCHEMA='{_U(schema_name)}'
+                                """)
+                                out["FUNCTIONS"] = [tuple(r) for r in cur.fetchall()]
+                                st.caption("Object owners (where available):")
+                                st.json(out)
+                    except Exception as e:
+                        st.error(f"Check failed: {e}")
+def list_users(conn, like: Optional[str] = None, limit: int = 200):
+    """
+    Returns rows from SHOW USERS (requires SECURITYADMIN or ACCOUNTADMIN).
+    """
+    sql = "SHOW USERS"
+    if like and like.strip():
+        sql += f" LIKE '{like.strip()}'"
+    with conn.cursor(snowflake.connector.DictCursor) as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    # keep it small if lots of users
+    return rows[:limit]
+
+def get_user_details(conn, user: str) -> Dict[str, Any]:
+    """
+    Read one user's details using DESCRIBE USER.
+    """
+    with conn.cursor(snowflake.connector.DictCursor) as cur:
+        cur.execute(f"DESC USER {sql_ident(user)}")
+        rows = cur.fetchall()
+    # Convert key/value rows to a dict {property: value}
+    out = {}
+    for r in rows:
+        k = (r.get("property") or "").upper()
+        v = r.get("value")
+        if k:
+            out[k] = v
+    return out
 
 # -------------------------
 # Users (create/update)
@@ -1493,6 +1884,71 @@ def grant_schema_usage_current_and_future(conn, user: str, dbs: list[str]):
 with tab_users:
     st.subheader("Users")
 
+    # ---- Users Browser ----
+    st.markdown("**Browse existing users**")
+    bc1, bc2, bc3 = st.columns([2,1,1])
+    with bc1:
+        user_filter = st.text_input("Filter (SHOW USERS LIKE ...)", value="", key="usr_filter")
+    with bc2:
+        max_rows = st.number_input("Max rows", min_value=10, max_value=1000, value=200, step=10, key="usr_max_rows")
+    with bc3:
+        do_refresh = st.button("Refresh list", key="usr_refresh")
+
+    users_rows = st.session_state.get("usr_last_list", [])
+
+    if do_refresh:
+        try:
+            with get_conn() as conn:
+                users_rows = list_users(conn, like=user_filter or None, limit=int(max_rows))
+            st.session_state["usr_last_list"] = users_rows
+        except Exception as e:
+            st.error(f"Could not list users (need SECURITYADMIN?): {e}")
+
+    if users_rows:
+        st.caption(f"Rows: {len(users_rows)}")
+        for r in users_rows:
+            uname = r.get("name") or r.get("login_name") or ""
+            owner = r.get("owner") or ""
+            created_on = r.get("created_on") or ""
+            c1, c2, c3, c4 = st.columns([3,3,3,1])
+            with c1:
+                st.write(f"**{uname}**")
+            with c2:
+                st.write(f"Owner: {owner}")
+            with c3:
+                st.write(str(created_on))
+            with c4:
+                if st.button("Load", key=f"usr_pick_{uname}"):
+                    try:
+                        with get_conn() as conn:
+                            d = get_user_details(conn, uname)
+                        # Pre-fill the form fields below
+                        st.session_state["usr_name"] = uname
+                        st.session_state["usr_login"] = d.get("LOGIN_NAME") or ""
+                        st.session_state["usr_display"] = d.get("DISPLAY_NAME") or ""
+                        st.session_state["usr_email"] = d.get("EMAIL") or ""
+                        st.session_state["usr_disabled"] = (str(d.get("DISABLED","")).upper() == "TRUE")
+                        st.session_state["usr_np"] = d.get("NETWORK_POLICY") or ""
+                        st.session_state["usr_def_role"] = d.get("DEFAULT_ROLE") or st.session_state.get("usr_def_role","")
+                        st.session_state["usr_def_wh"] = d.get("DEFAULT_WAREHOUSE") or st.session_state.get("usr_def_wh","")
+                        # DEFAULT_NAMESPACE -> DB.SCHEMA
+                        ns = (d.get("DEFAULT_NAMESPACE") or "")
+                        if "." in ns:
+                            dbp, scp = ns.split(".", 1)
+                            st.session_state["usr_def_db"] = dbp.strip('"')
+                            st.session_state["usr_def_schema"] = scp.strip('"')
+                        else:
+                            st.session_state["usr_def_db"] = st.session_state.get("usr_def_db","")
+                            st.session_state["usr_def_schema"] = st.session_state.get("usr_def_schema","")
+                        st.success(f"Loaded details for {uname} below ⤵")
+                    except Exception as e:
+                        st.error(f"Failed to load user details: {e}")
+    else:
+        st.info("No users listed yet. Click **Refresh list** (requires SECURITYADMIN or ACCOUNTADMIN).")
+
+    st.divider()
+
+    # ---- Create / Update form ----
     # Identity basics
     c1, c2 = st.columns([2,1])
     with c1:
@@ -1501,21 +1957,21 @@ with tab_users:
         display_name = st.text_input("DISPLAY_NAME (optional)", key="usr_display")
         email = st.text_input("EMAIL (optional)", key="usr_email")
     with c2:
-        disabled = st.checkbox("Disabled", value=False, key="usr_disabled")
+        disabled = st.checkbox("Disabled", value=st.session_state.get("usr_disabled", False), key="usr_disabled")
         network_policy = st.text_input("NETWORK_POLICY (optional)", key="usr_np")
 
     # Defaults
     st.markdown("**Defaults**")
     c3, c4, c5 = st.columns(3)
     with c3:
-        default_role = st.text_input("DEFAULT_ROLE", value="AQS_APP_READER", key="usr_def_role")
+        default_role = st.text_input("DEFAULT_ROLE", value=st.session_state.get("usr_def_role","AQS_APP_READER"), key="usr_def_role")
     with c4:
-        default_wh = st.text_input("DEFAULT_WAREHOUSE", value="WH_DATA_TEAM", key="usr_def_wh")
+        default_wh = st.text_input("DEFAULT_WAREHOUSE", value=st.session_state.get("usr_def_wh","WH_DATA_TEAM"), key="usr_def_wh")
     with c5:
-        default_db = st.text_input("DEFAULT_DB (for DEFAULT_NAMESPACE)", value="", key="usr_def_db")
-    default_schema = st.text_input("DEFAULT_SCHEMA (for DEFAULT_NAMESPACE)", value="", key="usr_def_schema")
+        default_db = st.text_input("DEFAULT_DB (for DEFAULT_NAMESPACE)", value=st.session_state.get("usr_def_db",""), key="usr_def_db")
+    default_schema = st.text_input("DEFAULT_SCHEMA (for DEFAULT_NAMESPACE)", value=st.session_state.get("usr_def_schema",""), key="usr_def_schema")
 
-    # Auth style selector
+    # Authentication
     st.markdown("**Authentication**")
     auth_mode = st.radio(
         "Choose how this user authenticates",
@@ -1564,7 +2020,6 @@ with tab_users:
         else:
             try:
                 with get_conn() as conn:
-                    # Create / update user with chosen auth mode
                     generated = create_or_update_user_simple(
                         conn,
                         user=user_name,
@@ -1582,25 +2037,20 @@ with tab_users:
                         temp_password=(temp_password or None),
                         must_change_password=must_change,
                     )
-
-                    # Role grants
+                    # Roles
                     roles = [r.strip() for r in roles_to_grant.split(",") if r.strip()]
                     if roles:
                         grant_roles_to_user(conn, roles, user_name)
-
-                    # DB allowlist with optional schema usage grants
+                    # DB allowlist (+ optional schema usage)
                     if allowed_dbs:
-                        # first, align DB USAGE exactly to the allowlist
-                        grants, revokes = ensure_db_allowlist(conn, user_name, set(allowed_dbs), dry_run=False)
-                        # then, optionally grant schema usage (current + future)
+                        ensure_db_allowlist(conn, user_name, set(allowed_dbs), dry_run=False)
                         if grant_schema_usage:
-                            ok, fail = grant_schema_usage_current_and_future(conn, user_name, allowed_dbs)
-                    st.success(f"User {user_name} created/updated; roles and DB access applied.")
+                            grant_schema_usage_current_and_future(conn, user_name, allowed_dbs)
 
-                    # Show the generated password exactly once if we created it
-                    if generated:
-                        st.warning("Copy the temporary password now; it won't be shown again in this app session.")
-                        st.code(generated)
+                st.success(f"User {user_name} created/updated; roles and DB access applied.")
+                if generated:
+                    st.warning("Copy the temporary password now; it won't be shown again in this app session.")
+                    st.code(generated)
             except Exception as e:
                 st.error(f"User create/update failed: {e}")
 
