@@ -9,17 +9,26 @@ import pathlib
 import re
 import secrets
 import string
+import time
+from dataclasses import dataclass
+import os
+import configparser
 
-# Optional: S3 bucket create/delete
+# Optional: S3 / Glue
 try:
-    import boto3  # used from the S3 Buckets tab
-    from botocore.exceptions import ClientError
+    import boto3  # used from S3 + CDA tabs
+    from botocore.exceptions import ClientError, ProfileNotFound, NoCredentialsError
+    from botocore.session import Session as BotocoreSession
     HAS_BOTO3 = True
 except Exception:
     HAS_BOTO3 = False
 
-st.set_page_config(page_title="Snowflake Setup Assistant", page_icon="❄️", layout="wide")
-
+st.set_page_config(
+    page_title="Snowflake and AWS Orchestrator",  
+    page_icon="❄️",                               
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 # =========================
 # Key-pair Snowflake connect
 # =========================
@@ -263,9 +272,539 @@ def exec_sqls(conn, statements: List[str]) -> Tuple[List[Tuple[str, str]], List[
                 fail.append((sql, str(e)))
     return ok, fail
 
+# =========================================================
+# CDA ACCESS CHECK (S3 + Glue Copy/Job Management)
+# =========================================================
+@dataclass
+class CheckResult:
+    resource: str
+    check: str
+    status: str   # PASS / FAIL / WARN / SKIP / DRY-RUN / OK
+    details: str
+
+def _pass(resource, check, details=""): return CheckResult(resource, check, "PASS", details)
+def _fail(resource, check, details=""): return CheckResult(resource, check, "FAIL", details)
+def _warn(resource, check, details=""): return CheckResult(resource, check, "WARN", details)
+def _skip(resource, check, details=""): return CheckResult(resource, check, "SKIP", details)
+
+# ---- AWS helpers
+def _aws_profiles() -> list[str]:
+    if not HAS_BOTO3:
+        return []
+    try:
+        return BotocoreSession().available_profiles or []
+    except Exception:
+        return []
+
+def _assume_role(base_sess, role_arn: str, session_name="cda-access-session", external_id: Optional[str] = None):
+    sts = base_sess.client("sts")
+    params = {"RoleArn": role_arn, "RoleSessionName": session_name, "DurationSeconds": 3600}
+    if external_id:
+        params["ExternalId"] = external_id
+    creds = sts.assume_role(**params)["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name=base_sess.region_name,
+    )
+
+def _save_aws_profile(profile_name: str, access_key: str, secret_key: str, session_token: Optional[str], region: str) -> None:
+    """
+    Writes/updates ~/.aws/credentials and ~/.aws/config for the given profile.
+    """
+    cred_path = os.path.expanduser("~/.aws/credentials")
+    cfg_path  = os.path.expanduser("~/.aws/config")
+    os.makedirs(os.path.dirname(cred_path), exist_ok=True)
+
+    # credentials
+    cred = configparser.RawConfigParser()
+    if os.path.exists(cred_path):
+        cred.read(cred_path)
+    if not cred.has_section(profile_name):
+        cred.add_section(profile_name)
+    cred.set(profile_name, "aws_access_key_id", access_key)
+    cred.set(profile_name, "aws_secret_access_key", secret_key)
+    if session_token:
+        cred.set(profile_name, "aws_session_token", session_token)
+    elif cred.has_option(profile_name, "aws_session_token"):
+        cred.remove_option(profile_name, "aws_session_token")
+    with open(cred_path, "w") as f:
+        cred.write(f)
+
+    # config
+    cfg = configparser.RawConfigParser()
+    if os.path.exists(cfg_path):
+        cfg.read(cfg_path)
+    section = f"profile {profile_name}" if profile_name != "default" else "default"
+    if not cfg.has_section(section):
+        cfg.add_section(section)
+    cfg.set(section, "region", region)
+    with open(cfg_path, "w") as f:
+        cfg.write(f)
+
+def _make_session(profile: Optional[str], region: str, role_arn: Optional[str], external_id: Optional[str]):
+    if not HAS_BOTO3:
+        raise RuntimeError("boto3 not available")
+    base = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
+    return _assume_role(base, role_arn, external_id=external_id) if role_arn else base
+
+def _make_session(profile: Optional[str], region: str, role_arn: Optional[str], external_id: Optional[str],
+                  access_key: Optional[str] = None, secret_key: Optional[str] = None,
+                  session_token: Optional[str] = None):
+    """
+    Creates a boto3.Session either from a profile OR from explicit keys.
+    Role assumption is supported in both cases.
+    """
+    if not HAS_BOTO3:
+        raise RuntimeError("boto3 not available")
+
+    if access_key and secret_key:
+        base = boto3.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=session_token,
+            region_name=region,
+        )
+    else:
+        base = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
+
+    return _assume_role(base, role_arn, external_id=external_id) if role_arn else base
+
+def bucket_name(env: str, xcenter: str, archive: bool = False) -> str:
+    env_l = env.lower()
+    xc_l = xcenter.lower()
+    return f"cig-{env_l}-env-aqs-gw-landing-zone-{xc_l}-01-bucket" + ("-archive" if archive else "")
+
+def _xcenter_list(flags: dict[str, bool]) -> list[str]:
+    return [k for k, v in flags.items() if v]
+
+# ---- Access S3 checks
+def _check_s3_bucket_exists(s3, bucket: str) -> CheckResult:
+    try:
+        s3.head_bucket(Bucket=bucket)
+        return _pass(bucket, "Exists")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        return _fail(bucket, "Exists", f"head_bucket error: {code}")
+
+def _check_default_encryption(s3, bucket: str) -> CheckResult:
+    try:
+        resp = s3.get_bucket_encryption(Bucket=bucket)
+        rules = resp["ServerSideEncryptionConfiguration"]["Rules"]
+        algos = [r["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] for r in rules]
+        if "aws:kms" in algos or "AES256" in algos:
+            return _pass(bucket, "Default Encryption", f"SSEAlgorithms: {algos}")
+        return _fail(bucket, "Default Encryption", f"SSEAlgorithms: {algos}")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ServerSideEncryptionConfigurationNotFoundError", "NoSuchBucket"):
+            return _fail(bucket, "Default Encryption", code)
+        return _fail(bucket, "Default Encryption", f"Error: {code}")
+
+def _check_versioning(s3, bucket: str) -> CheckResult:
+    try:
+        resp = s3.get_bucket_versioning(Bucket=bucket)
+        status = resp.get("Status", "Disabled")
+        if status == "Enabled":
+            return _pass(bucket, "Versioning", status)
+        return _warn(bucket, "Versioning", status or "Disabled")
+    except ClientError as e:
+        return _fail(bucket, "Versioning", f"Error: {e.response.get('Error', {}).get('Code')}")
+
+def _probe_read_write(s3, bucket: str, prefix: str, do_write: bool) -> List[CheckResult]:
+    results: List[CheckResult] = []
+    test_key = f"{prefix.rstrip('/')}/_cda_access_probe/{int(time.time())}.txt"
+    try:
+        _ = s3.list_objects_v2(Bucket=bucket, MaxKeys=1)
+        results.append(_pass(bucket, "List Objects (read)", "OK"))
+    except ClientError as e:
+        results.append(_fail(bucket, "List Objects (read)", f"Error: {e.response.get('Error',{}).get('Code')}"))
+
+    if not do_write:
+        results.append(_skip(bucket, "Write Probe", "Disabled in UI"))
+        return results
+
+    try:
+        s3.put_object(Bucket=bucket, Key=test_key, Body=b"cda-access-probe")
+        results.append(_pass(bucket, "Write (put_object)", f"Key: {test_key}"))
+        s3.delete_object(Bucket=bucket, Key=test_key)
+        results.append(_pass(bucket, "Cleanup (delete_object)", "OK"))
+    except ClientError as e:
+        results.append(_fail(bucket, "Write/Delete Probe", f"Error: {e.response.get('Error',{}).get('Code')}"))
+    return results
+
+# ---- Glue helpers (copy + job minimal)
+@dataclass
+class CopyPlanItem:
+    src_bucket: str
+    src_key: str
+    dst_bucket: str
+    dst_key: str
+    load_type: str
+    xcenter: str
+    env_src: str
+    env_dst: str
+
+DEFAULT_SCRIPT_PREFIX = "glue/scripts"
+DEFAULT_FILE_STEM     = "cda_{env}_{xcenter}_{load_type}.py"
+
+def _exists_s3_key(s3, bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NotFound", "NoSuchKey"):
+            return False
+        raise
+
+def _read_s3_text(s3, bucket: str, key: str) -> str:
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return obj["Body"].read().decode("utf-8")
+
+def _write_s3_text(s3, bucket: str, key: str, text: str, kms_key_id: Optional[str] = None):
+    args = dict(Bucket=bucket, Key=key, Body=text.encode("utf-8"))
+    if kms_key_id:
+        args["ServerSideEncryption"] = "aws:kms"
+        args["SSEKMSKeyId"] = kms_key_id
+    s3.put_object(**args)
+
+def _subs(text: str, env: str, xcenter: str, load_type: str, extras: dict) -> str:
+    mapping = {"env": env, "xcenter": xcenter, "load_type": load_type, **(extras or {})}
+    for k, v in mapping.items():
+        text = text.replace("{"+k+"}", v)
+    return text
+
+def _build_copy_plan(env_src: str, env_dst: str, xcenters: list[str], load_types: list[str],
+                     src_bucket: str, dst_bucket: str, src_prefix: str, dst_prefix: str,
+                     file_stem_pattern: str) -> list[CopyPlanItem]:
+    plan: list[CopyPlanItem] = []
+    for xc in xcenters:
+        for lt in load_types:
+            fn_src = file_stem_pattern.format(env=env_src.lower(), xcenter=xc.lower(), load_type=lt.lower())
+            fn_dst = file_stem_pattern.format(env=env_dst.lower(), xcenter=xc.lower(), load_type=lt.lower())
+            plan.append(CopyPlanItem(
+                src_bucket=src_bucket,
+                src_key=f"{src_prefix.rstrip('/')}/{fn_src}",
+                dst_bucket=dst_bucket,
+                dst_key=f"{dst_prefix.rstrip('/')}/{fn_dst}",
+                load_type=lt.upper(),
+                xcenter=xc.upper(),
+                env_src=env_src.upper(),
+                env_dst=env_dst.upper(),
+            ))
+    return plan
+def tab_cda_access_check():
+    st.subheader("CDA Access Check")
+    st.caption("Validate Guidewire CDA S3 access and copy/rename Glue scripts across environments.")
+
+    if not HAS_BOTO3:
+        st.error("boto3 is not installed. Install boto3 to enable this tab.")
+        return
+
+    tabs = st.tabs(["Access Checks", "Glue Script Copier & Job Builder"])
+
+    # ----------------- ACCESS CHECKS -----------------
+    with tabs[0]:
+        col0, col1, col2 = st.columns([1,1,1])
+
+        # --- Auth / account block (radio + save-as-profile) ---
+        with col0:
+            profiles = _aws_profiles()
+
+            auth_method = st.radio(
+                "Authentication",
+                ["Profile", "Access keys"],
+                horizontal=True,
+                key="cda_auth_method",
+            )
+            role_arn    = st.text_input("Assume Role ARN (optional)", placeholder="arn:aws:iam::123:role/YourRole", key="cda_role_arn")
+            external_id = st.text_input("External ID (optional)", key="cda_external_id")
+
+            profile = None
+            ak = sk = tk = None
+            save_profile = False
+            new_prof_name = None
+
+            if auth_method == "Profile":
+                profile = st.selectbox("AWS Profile", profiles, index=0 if profiles else None, key="cda_profile")
+                st.caption("Profiles are loaded from ~/.aws/credentials and ~/.aws/config")
+            else:
+                ak = st.text_input("AWS Access Key ID", placeholder="AKIA...", key="cda_ak")
+                sk = st.text_input("AWS Secret Access Key", type="password", key="cda_sk")
+                tk = st.text_input("Session Token (optional)", key="cda_sts")
+                save_profile = st.checkbox("Save as new profile", key="cda_save_prof")
+                new_prof_name = st.text_input(
+                    "Profile name",
+                    value=("streamlit-cda" if profiles else "default"),
+                    key="cda_new_prof_name",
+                ) if save_profile else None
+
+        with col1:
+            region = st.selectbox("Region", ["us-east-1", "us-west-2", "eu-west-1", "eu-central-1"], index=0, key="cda_region")
+            env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="cda_env")
+            x_bc = st.checkbox("BC", value=True, key="cda_bc")
+            x_cc = st.checkbox("CC", value=False, key="cda_cc")
+            x_pc = st.checkbox("PC", value=False, key="cda_pc")
+
+        with col2:
+            list_prefix = st.text_input("Probe prefix (for list/write)", value="data/", key="cda_list_prefix")
+            enable_write_probe = st.checkbox("Enable write/delete probe", value=False, key="cda_write_probe")
+            run_btn = st.button("Run Access Checks", type="primary", key="cda_run_checks")
+
+        if run_btn:
+            # Optionally persist keys as a profile
+            if auth_method == "Access keys" and save_profile and ak and sk and new_prof_name:
+                try:
+                    _save_aws_profile(new_prof_name, ak, sk, tk or None, region)
+                    st.success(f"Saved credentials to profile '{new_prof_name}'.")
+                    profile = new_prof_name
+                    ak = sk = tk = None
+                    auth_method = "Profile"
+                except Exception as e:
+                    st.warning(f"Could not save profile: {e}")
+
+            # Build session (either path) + AssumeRole
+            try:
+                session = _make_session(
+                    profile=profile if auth_method == "Profile" else None,
+                    region=region,
+                    role_arn=role_arn or None,
+                    external_id=external_id or None,
+                    access_key=ak if auth_method == "Access keys" else None,
+                    secret_key=sk if auth_method == "Access keys" else None,
+                    session_token=tk if auth_method == "Access keys" else None,
+                )
+                s3 = session.client("s3")
+            except ProfileNotFound:
+                st.error(f"Profile '{profile}' not found."); return
+            except NoCredentialsError:
+                st.error("No AWS credentials found. Provide keys or choose a profile."); return
+            except ClientError as e:
+                st.error(f"AWS error: {e}"); return
+            except Exception as e:
+                st.error(f"Session error: {e}"); return
+
+            xcenters = [c for c, on in [("BC", x_bc), ("CC", x_cc), ("PC", x_pc)] if on]
+            target_buckets = [bucket_name(env, xc, False) for xc in xcenters] + [bucket_name(env, xc, True) for xc in xcenters]
+            target_buckets = sorted(set(target_buckets))
+            st.code("\n".join(target_buckets), language="text")
+
+            results: List[CheckResult] = []
+            progress = st.progress(0.0, text="Running checks…")
+            for i, b in enumerate(target_buckets, start=1):
+                progress.progress(i/len(target_buckets), text=f"Checking {b}…")
+                r0 = _check_s3_bucket_exists(s3, b); results.append(r0)
+                if r0.status != "PASS":
+                    results += [
+                        _skip(b, "Default Encryption", "Bucket missing"),
+                        _skip(b, "Versioning", "Bucket missing"),
+                        _skip(b, "List Objects (read)", "Bucket missing"),
+                        _skip(b, "Write Probe", "Bucket missing"),
+                        _skip(b, "Cleanup (delete_object)", "Bucket missing"),
+                    ]
+                    continue
+                results.append(_check_default_encryption(s3, b))
+                results.append(_check_versioning(s3, b))
+                results += _probe_read_write(s3, b, list_prefix, enable_write_probe)
+            progress.empty()
+
+            import pandas as pd
+            df = pd.DataFrame([r.__dict__ for r in results])[["resource", "check", "status", "details"]].sort_values(["resource", "status", "check"])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.success(f"Summary — PASS: {(df.status=='PASS').sum()} • WARN: {(df.status=='WARN').sum()} • FAIL: {(df.status=='FAIL').sum()} • SKIP: {(df.status=='SKIP').sum()}")
+            st.download_button("Download CSV", data=df.to_csv(index=False), file_name="cda_access_results.csv", mime="text/csv")
+        else:
+            st.info("Configure options and click **Run Access Checks**.")
+
+    # --------- GLUE SCRIPT COPIER & JOB BUILDER ----------
+    with tabs[1]:
+        st.markdown("#### Source & Destination")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            region_g = st.selectbox("AWS Region", ["us-east-1", "us-west-2", "eu-west-1", "eu-central-1"], index=0, key="glue_region")
+            profiles = _aws_profiles()
+            auth_src = st.radio("Auth (Source)", ["Profile", "Access keys"], horizontal=True, key="glue_auth_src")
+            auth_dst = st.radio("Auth (Destination)", ["Profile", "Access keys"], horizontal=True, key="glue_auth_dst")
+        with c2:
+            role_src = st.text_input("Assume Role ARN (source, optional)", key="glue_role_src")
+            role_dst = st.text_input("Assume Role ARN (dest, optional)", key="glue_role_dst")
+            external_id = st.text_input("External ID (optional)", key="glue_extid")
+        with c3:
+            env_src = st.radio("Source Env", ["DEV", "QA", "STG"], index=0, horizontal=True, key="glue_env_src")
+            env_dst = st.radio("Destination Env", ["DEV", "QA", "STG"], index=1, horizontal=True, key="glue_env_dst")
+
+        # Source auth inputs
+        if auth_src == "Profile":
+            profile_src = st.selectbox("Source Profile", profiles, index=0 if profiles else None, key="glue_profile_src")
+            ak_src = sk_src = tk_src = None
+            save_src = False; new_prof_src = None
+        else:
+            col_sk1, col_sk2 = st.columns(2)
+            with col_sk1:
+                ak_src = st.text_input("SRC Access Key ID", value="", key="glue_ak_src")
+                tk_src = st.text_input("SRC Session Token (optional)", value="", key="glue_tk_src")
+            with col_sk2:
+                sk_src = st.text_input("SRC Secret Access Key", value="", type="password", key="glue_sk_src")
+                save_src = st.checkbox("Save SRC as profile", key="glue_save_src")
+                new_prof_src = st.text_input("SRC Profile name", value="streamlit-cda-src", key="glue_prof_src") if save_src else None
+            profile_src = None
+
+        # Destination auth inputs
+        if auth_dst == "Profile":
+            profile_dst = st.selectbox("Destination Profile", profiles, index=0 if profiles else None, key="glue_profile_dst")
+            ak_dst = sk_dst = tk_dst = None
+            save_dst = False; new_prof_dst = None
+        else:
+            col_dk1, col_dk2 = st.columns(2)
+            with col_dk1:
+                ak_dst = st.text_input("DST Access Key ID", value="", key="glue_ak_dst")
+                tk_dst = st.text_input("DST Session Token (optional)", value="", key="glue_tk_dst")
+            with col_dk2:
+                sk_dst = st.text_input("DST Secret Access Key", value="", type="password", key="glue_sk_dst")
+                save_dst = st.checkbox("Save DST as profile", key="glue_save_dst")
+                new_prof_dst = st.text_input("DST Profile name", value="streamlit-cda-dst", key="glue_prof_dst") if save_dst else None
+            profile_dst = None
+
+        # Save entered keys as profiles if requested
+        if auth_src == "Access keys" and save_src and ak_src and sk_src and new_prof_src:
+            try:
+                _save_aws_profile(new_prof_src, ak_src, sk_src, tk_src or None, region_g)
+                st.success(f"Saved SRC credentials to profile '{new_prof_src}'.")
+                profile_src, ak_src, sk_src, tk_src = new_prof_src, None, None, None
+                auth_src = "Profile"
+            except Exception as e:
+                st.warning(f"Could not save SRC profile: {e}")
+
+        if auth_dst == "Access keys" and save_dst and ak_dst and sk_dst and new_prof_dst:
+            try:
+                _save_aws_profile(new_prof_dst, ak_dst, sk_dst, tk_dst or None, region_g)
+                st.success(f"Saved DST credentials to profile '{new_prof_dst}'.")
+                profile_dst, ak_dst, sk_dst, tk_dst = new_prof_dst, None, None, None
+                auth_dst = "Profile"
+            except Exception as e:
+                st.warning(f"Could not save DST profile: {e}")
+
+        # Build sessions
+        try:
+            sess_src = _make_session(
+                profile=profile_src if auth_src == "Profile" else None,
+                region=region_g,
+                role_arn=role_src or None,
+                external_id=external_id or None,
+                access_key=ak_src if auth_src == "Access keys" else None,
+                secret_key=sk_src if auth_src == "Access keys" else None,
+                session_token=tk_src if auth_src == "Access keys" else None,
+            )
+            sess_dst = _make_session(
+                profile=profile_dst if auth_dst == "Profile" else None,
+                region=region_g,
+                role_arn=role_dst or None,
+                external_id=external_id or None,
+                access_key=ak_dst if auth_dst == "Access keys" else None,
+                secret_key=sk_dst if auth_dst == "Access keys" else None,
+                session_token=tk_dst if auth_dst == "Access keys" else None,
+            )
+            s3_src = sess_src.client("s3")
+            s3_dst = sess_dst.client("s3")
+        except ProfileNotFound as e:
+            st.error(str(e)); return
+        except NoCredentialsError:
+            st.error("No AWS credentials found for SRC/DST. Provide keys or choose profiles."); return
+        except ClientError as e:
+            st.error(f"AWS error: {e}"); return
+        except Exception as e:
+            st.error(f"Session error: {e}"); return
+
+        st.markdown("#### Xcenters & Load Types")
+        c4, c5 = st.columns(2)
+        with c4:
+            x_bc = st.checkbox("BC", value=True, key="glue_bc")
+            x_cc = st.checkbox("CC", value=False, key="glue_cc")
+            x_pc = st.checkbox("PC", value=False, key="glue_pc")
+            xcenters = [k for k, v in {"BC": x_bc, "CC": x_cc, "PC": x_pc}.items() if v]
+            inc_initial = st.toggle("Include INITIAL", value=True, key="glue_lt_init")
+            inc_incr    = st.toggle("Include INCREMENTAL", value=True, key="glue_lt_incr")
+            load_types = [lt for lt, on in [("INITIAL", inc_initial), ("INCREMENTAL", inc_incr)] if on]
+        with c5:
+            src_bucket = st.text_input("Source Script Bucket", value=bucket_name(env_src, (xcenters or ['BC'])[0], archive=False), key="glue_src_bkt")
+            dst_bucket = st.text_input("Destination Script Bucket", value=bucket_name(env_dst, (xcenters or ['BC'])[0], archive=False), key="glue_dst_bkt")
+            src_prefix = st.text_input("Source Prefix", value=DEFAULT_SCRIPT_PREFIX, key="glue_src_prefix")
+            dst_prefix = st.text_input("Destination Prefix", value=DEFAULT_SCRIPT_PREFIX, key="glue_dst_prefix")
+            file_stem = st.text_input("Filename Pattern", value=DEFAULT_FILE_STEM, help="Tokens: {env}, {xcenter}, {load_type}", key="glue_file_stem")
+
+        st.markdown("#### Token Substitution (optional)")
+        st.caption("Replaces tokens in script body on copy (e.g., {env}, {xcenter}, {load_type}, {bucket}, {prefix})")
+        col_et1, col_et2 = st.columns(2)
+        with col_et1:
+            token_bucket = st.text_input("Token {bucket}", value=dst_bucket, key="glue_tok_bucket")
+            token_prefix = st.text_input("Token {prefix}", value=dst_prefix, key="glue_tok_prefix")
+        with col_et2:
+            token_extra1_k = st.text_input("Extra token key (optional)", value="", key="glue_tok_k")
+            token_extra1_v = st.text_input("Extra token value", value="", key="glue_tok_v")
+        extra_tokens = {"bucket": token_bucket, "prefix": token_prefix}
+        if token_extra1_k.strip():
+            extra_tokens[token_extra1_k.strip("{} ")] = token_extra1_v.strip()
+
+        st.markdown("#### Plan & Execute")
+        dry_run = st.checkbox("Dry-run (preview only — do not write)", value=True, key="glue_dry")
+        overwrite = st.checkbox("Overwrite if destination exists", value=False, key="glue_overwrite")
+        kms_key_id = st.text_input("SSE-KMS Key ID (optional for script objects)", key="glue_kms")
+        build_btn = st.button("Build Copy Plan", key="glue_build")
+        exec_btn  = st.button("Execute Copy", key="glue_exec")
+
+        if build_btn or exec_btn:
+            if not xcenters:
+                st.error("Select at least one xcenter."); return
+            if not load_types:
+                st.error("Select at least one load type."); return
+
+            plan = _build_copy_plan(env_src, env_dst, xcenters, load_types, src_bucket, dst_bucket, src_prefix, dst_prefix, file_stem)
+
+            import pandas as pd
+            st.dataframe(pd.DataFrame([p.__dict__ for p in plan]), use_container_width=True, hide_index=True)
+
+            if exec_btn:
+                results = []
+                progress = st.progress(0.0, text="Copying scripts…")
+                for i, item in enumerate(plan, start=1):
+                    progress.progress(i/len(plan), text=f"{i}/{len(plan)} {item.src_key} → {item.dst_key}")
+                    status, detail = "SKIP", ""
+                    if not _exists_s3_key(s3_src, item.src_bucket, item.src_key):
+                        status, detail = "FAIL", "Source key not found"
+                    else:
+                        try:
+                            body = _read_s3_text(s3_src, item.src_bucket, item.src_key)
+                            body2 = _subs(body, env=item.env_dst, xcenter=item.xcenter, load_type=item.load_type, extras=extra_tokens)
+                            if _exists_s3_key(s3_dst, item.dst_bucket, item.dst_key) and not overwrite:
+                                status, detail = "SKIP", "Destination exists (overwrite disabled)"
+                            else:
+                                if dry_run:
+                                    status, detail = "DRY-RUN", f"Would write s3://{item.dst_bucket}/{item.dst_key}"
+                                else:
+                                    _write_s3_text(s3_dst, item.dst_bucket, item.dst_key, body2, kms_key_id=kms_key_id or None)
+                                    status, detail = "OK", f"Wrote s3://{item.dst_bucket}/{item.dst_key}"
+                        except ClientError as e:
+                            status, detail = "FAIL", f"AWS error: {e.response.get('Error',{}).get('Code')}"
+                        except Exception as e:
+                            status, detail = "FAIL", f"{type(e).__name__}: {e}"
+
+                    results.append({
+                        "xcenter": item.xcenter, "load_type": item.load_type,
+                        "src": f"s3://{item.src_bucket}/{item.src_key}",
+                        "dst": f"s3://{item.dst_bucket}/{item.dst_key}",
+                        "status": status, "detail": detail
+                    })
+                progress.empty()
+                df_res = pd.DataFrame(results)
+                st.dataframe(df_res, use_container_width=True, hide_index=True)
+                st.download_button("Download results CSV", data=df_res.to_csv(index=False), file_name="glue_copy_results.csv")
+
+
+
 # ============ UI ============
-st.title("❄️ Snowflake Setup Assistant")
-st.caption("Create environments; destructively clone & normalize ETL_CTRL per xcenter; build S3 integrations & stages; manage user access; optional S3 bucket create/delete.")
+st.title("❄️ Snowflake and AWS Orchestrator")
+st.caption("Provision, connect, and orchestrate Snowflake & AWS (S3, Glue, IAM) environments end-to-end.")
 
 with st.sidebar:
     st.header("Connection (Key-pair)")
@@ -276,23 +815,26 @@ with st.sidebar:
     st.session_state.private_key_path = st.text_input("Private key path", value=r"C:\\Users\\rsuthrapu\\.snowflake\\keys\\rsa_key.p8", key="sb_pk_path")
     st.session_state.private_key_passphrase = st.text_input("Key passphrase (if set)", type="password", key="sb_pk_pass")
 
-# Tabs
-tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_user_access, tab_users, tab_preview_exec, tab_audit, tab_ownership, tab_delete, tab_buckets = st.tabs(
+
+# Tabs 
+tab_setup, tab_env, tab_warehouse, tab_cloud, tab_migrate, tab_user_access, tab_users, tab_preview_exec, tab_audit, tab_ownership, tab_delete, tab_buckets, tab_cda_tab = st.tabs(
     [
-        "Setup Plan",
-        "Environment Builder",
-        "Warehouses",
-        "AWS / S3 Integration",
-        "Migrate Objects",
-        "User Access",
-        "Users",
-        "Preview & Execute",
-        "Audit / Logs",
-        "Ownership Handoff",   
-        "Delete Environment",
-        "S3 Buckets"
+        "🧭 Setup Plan",
+        "🏗️ Environment Builder",
+        "⚙️ Warehouses",
+        "☁️ AWS / S3 Integration",
+        "🔄 Migrate Objects",
+        "🔑 User Access",
+        "👤 Users",
+        "▶️ Preview & Execute",
+        "🧾 Audit / Logs",
+        "🔁 Ownership Handoff",
+        "🗑️ Delete Environment",
+        "🪣 S3 Buckets",
+        "🧩 CDA Access Check",
     ]
 )
+
 
 # -------------------------
 # Setup Plan (multi-DB)
@@ -542,7 +1084,7 @@ with tab_warehouse:
 
             grant_roles = [r.strip() for r in grant_roles_raw.split(",") if r.strip()]
             for n in names:
-                wh_ident = f'IDENTIFIER(\'"{n}"\')'
+                wh_ident = f'IDENTIFIER(\'"WH_DATA_ENGNR_SML_{n}"\')' if not n.startswith("WH_DATA_ENGNR_SML_") else f'IDENTIFIER(\'"{n}"\')'
                 for r in grant_roles:
                     wh_plan.append(f"GRANT USAGE ON WAREHOUSE {wh_ident} TO ROLE {sql_ident(r)};")
 
@@ -967,7 +1509,6 @@ with tab_user_access:
     if not user_input:
         st.info("Enter a user to manage.")
     else:
-        # --- Session role toggle ---
         st.markdown("### Session Role")
         colr1, colr2, colr3 = st.columns([2,1,1])
         with colr1:
@@ -991,7 +1532,6 @@ with tab_user_access:
 
         st.divider()
 
-        # --- Move user between roles ---
         st.markdown("### Move User Between Roles")
         c3, c4, c5 = st.columns([2,2,2])
         with c3:
@@ -1026,7 +1566,6 @@ with tab_user_access:
 
         st.divider()
 
-        # --- Restrict to DB allowlist ---
         st.markdown("### Restrict Access to Selected Databases")
         try:
             with get_conn() as conn:
@@ -1061,7 +1600,6 @@ with tab_user_access:
 
         st.divider()
 
-        # --- Effective privileges viewer ---
         st.markdown("### Effective Grants Viewer")
         if st.button("Refresh Grants", key="ua_refresh_grants"):
             try:
@@ -1070,7 +1608,6 @@ with tab_user_access:
                 if grants:
                     with st.expander("Raw SHOW GRANTS TO USER output", expanded=False):
                         st.json(grants)
-                    # Quick summary
                     db_usage = [g for g in grants if (g.get("granted_on","").upper()=="DATABASE")]
                     role_grants = [g for g in grants if g.get("grant_type","").upper()=="ROLE_GRANT"]
                     st.write(f"Database USAGE entries: {len(db_usage)}")
@@ -1079,20 +1616,6 @@ with tab_user_access:
                     st.info("No grants visible for this user.")
             except Exception as e:
                 st.error(f"Show grants failed: {e}")
-
-        # --- Optional: generate auto-revoke helper SQL (copy only) ---
-        with st.expander("Generate auto-revoke helper (copy-only)", expanded=False):
-            target_role = st.text_input("Role to grant temporarily", key="ua_temp_role")
-            minutes = st.number_input("Minutes until revoke", min_value=5, max_value=1440, value=60, step=5, key="ua_temp_minutes")
-            if st.button("Generate SQL", key="ua_temp_gen"):
-                task_name = f"T_AUTO_REVOKE_{_U(user_input)}_{_U(target_role)}"
-                sqls = [
-                    f"GRANT ROLE {sql_ident(target_role)} TO USER {sql_ident(user_input)};",
-                    f"CREATE OR REPLACE TASK {sql_ident(task_name)} SCHEDULE = 'USING CRON */{minutes} * * * * UTC' COMMENT='Auto-revoke role grant' AS REVOKE ROLE {sql_ident(target_role)} FROM USER {sql_ident(user_input)};",
-                    f"ALTER TASK {sql_ident(task_name)} RESUME;"
-                ]
-                st.code("\n".join(sqls), language="sql")
-                st.caption("Note: Adjust schedule as needed; this is a copy-only helper.")
 
 # -------------------------
 # Preview & Execute
@@ -1146,381 +1669,6 @@ with tab_audit:
                     st.code(sql, language="sql")
                     st.error(err)
 
-# -------------------------
-# Delete Environment (ENV-aware + Dry-run)
-# -------------------------
-with tab_delete:
-    st.subheader("Danger Zone: Delete Environment (ENV + Xcenters)")
-    st.caption("Build a DROP plan based on DEV/QA and selected xcenters. Review carefully before executing.")
-
-    del_dry_run = st.checkbox("Dry-run (preview only — do not execute)", value=True, key="del_dry_run")
-    env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="del_env")
-    env_upper = env.upper()
-
-    st.markdown("**Select xcenters to delete**")
-    del_bc = st.checkbox("BC", value=False, key="del_bc")
-    del_cc = st.checkbox("CC", value=False, key="del_cc")
-    del_pc = st.checkbox("PC", value=False, key="del_pc")
-    centers = [c for c, flag in [("BC", del_bc), ("CC", del_cc), ("PC", del_pc)] if flag]
-
-    st.divider()
-
-    st.markdown("**Base DB names (editable)**")
-    coln1, coln2, coln3 = st.columns(3)
-    with coln1:
-        base_bc = st.text_input("BC → DB basename", value="BILLING", key="del_db_bc")
-    with coln2:
-        base_cc = st.text_input("CC → DB basename", value="CLAIMS", key="del_db_cc")
-    with coln3:
-        base_pc = st.text_input("PC → DB basename", value="POLICY", key="del_db_pc")
-
-    st.markdown("**Stage locations in Snowflake**")
-    del_db_for_stages = st.text_input("Database that holds S3 stages", value=f"AQS_{env_upper}", key="del_stage_db")
-    del_stage_schema   = st.text_input("Stage schema", value="STG", key="del_stage_schema")
-    stage_names = {"BC": "S3_LZ_BC", "CC": "S3_LZ_CC", "PC": "S3_LZ_PC"}
-
-    st.markdown("**Storage Integration**")
-    drop_integration = st.checkbox("Also drop the STORAGE INTEGRATION for this env", value=False, key="del_drop_integ")
-    integ_name = st.text_input("Integration name", value=f"AQS_S3_INT_{env_upper}", key="del_integ_name")
-
-    st.markdown("**Roles (optional)**")
-    drop_roles = st.checkbox("Drop app roles?", value=False, key="del_drop_roles")
-    roles_raw = st.text_input("Roles to drop (comma-separated)", value="AQS_APP_READER, AQS_APP_WRITER, AQS_APP_ADMIN", key="del_roles_raw")
-
-    st.markdown("**Warehouses**")
-    drop_wh = st.checkbox("Drop warehouses for selected xcenters", value=True, key="del_drop_wh")
-
-    st.divider()
-
-    # NEW: execution role + neutral DB option
-    exec_role_for_drop = st.text_input("Execution role for DROP", value="PROD_SYSADMIN", key="del_exec_role")
-    also_use_neutral_db = st.checkbox("Switch to neutral database before dropping (recommended)", value=True, key="del_use_neutral_db")
-
-    confirm_text = st.text_input("Type the environment name to confirm (DEV, QA, or STG)", key="del_confirm_text")
-
-    if st.button("Build DROP Plan", key="del_build_btn"):
-        if not centers:
-            st.error("Select at least one xcenter.")
-        else:
-            plan_drop: List[str] = []
-            for c in centers:
-                stg = stage_names[c]
-                plan_drop.append(
-                    f"DROP STAGE IF EXISTS {sql_ident(del_db_for_stages)}.{sql_ident(del_stage_schema)}.{sql_ident(stg)};"
-                )
-            if drop_integration and integ_name.strip():
-                plan_drop.append(f"DROP INTEGRATION IF EXISTS {sql_ident(integ_name.strip())};")
-
-            base_map = {"BC": base_bc, "CC": base_cc, "PC": base_pc}
-            for c in centers:
-                db_name = f"{base_map[c]}_AQS_{env_upper}".upper()
-                plan_drop.append(f"DROP DATABASE IF EXISTS {sql_ident(db_name)};")
-
-            if drop_wh:
-                for c in centers:
-                    wh_ident = f'IDENTIFIER(\'"WH_DATA_ENGNR_SML_{c}_AQS_{env_upper}"\')'
-                    plan_drop.append(f"DROP WAREHOUSE IF EXISTS {wh_ident};")
-
-            if drop_roles:
-                for r in [x.strip() for x in roles_raw.split(",") if x.strip()]:
-                    plan_drop.append(f"DROP ROLE IF EXISTS {sql_ident(r)};")
-
-            st.session_state.plan_drop = plan_drop
-            nice_panel("DROP Plan", "\n".join(plan_drop))
-
-            if confirm_text.strip().upper() != env_upper:
-                st.warning(f"Type **{env_upper}** in the confirmation box to enable execution.")
-            if del_dry_run:
-                st.info("Dry-run is ON: execution is disabled. Review the plan above.")
-            else:
-                st.success("Dry-run is OFF. You can execute the DROP plan below once confirmation matches.")
-
-    if st.session_state.get("plan_drop"):
-        can_execute = confirm_text.strip().upper() == env_upper and not del_dry_run
-        if can_execute:
-            if st.button("Execute DROP Plan (Irreversible)", type="primary", key="del_exec_btn"):
-                try:
-                    with get_conn() as conn:
-                        # Switch to the role that owns the objects (e.g., PROD_SYSADMIN)
-                        try:
-                            set_role(conn, exec_role_for_drop)
-                        except Exception as e:
-                            st.error(f"Could not switch to role {exec_role_for_drop}: {e}")
-                            raise
-
-                        # Optional: move to a neutral DB to avoid “in-use” issues when dropping target DBs
-                        if also_use_neutral_db:
-                            with conn.cursor() as cur:
-                                # SNOWFLAKE database is always present
-                                cur.execute("USE DATABASE SNOWFLAKE")
-
-                        cur = conn.cursor()
-                        success, failures = run_multi_sql(cur, st.session_state.plan_drop)
-
-                    st.session_state.audit = {"success": success, "failures": failures}
-                    if failures:
-                        st.warning("Completed with errors. DDL is auto-committed; some actions may already have applied.")
-                    else:
-                        st.success(f"{env_upper}: Selected xcenter environment objects dropped successfully.")
-                except Exception as e:
-                    st.error(f"Execution failed: {e}")
-        else:
-            if del_dry_run:
-                st.info("Execution disabled because Dry-run is ON.")
-            else:
-                st.info("Execution disabled until the confirmation text matches the environment (DEV, QA, or STG).")
-
-# -------------------------
-# Optional: Create / Delete S3 landing buckets & files
-# -------------------------
-with tab_buckets:
-    st.subheader("Create / Delete S3 Landing Buckets (optional)")
-
-    if not HAS_BOTO3:
-        st.warning("boto3 not installed in this environment. Install boto3 to enable S3 operations.")
-
-    region = st.text_input("AWS Region", value="us-east-1", key="bkt_region")
-    aws_access_key = st.text_input("AWS Access Key ID", value="", key="bkt_key")
-    aws_secret_key = st.text_input("AWS Secret Access Key", value="", type="password", key="bkt_secret")
-
-    env_b = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="bkt_env")
-    org_prefix_b = st.text_input("Org prefix", value="cig", key="bkt_org")
-    mid_tokens_b = st.text_input("Middle tokens", value="env-aqs-gw-landing-zone", key="bkt_mid")
-    index_token_b = st.text_input("Index token", value="01", key="bkt_idx")
-
-    want_bc_b = st.checkbox("BC", value=True, key="bkt_bc")
-    want_cc_b = st.checkbox("CC", value=True, key="bkt_cc")
-    want_pc_b = st.checkbox("PC", value=True, key="bkt_pc")
-
-    # Extra buckets per xcenter via suffixes (comma-separated)
-    extra_suffixes_raw = st.text_input("Extra bucket suffixes (comma-separated, appended as -<suffix>)", value="archive", key="bkt_suffixes")
-    # Optional initial folders to create inside each bucket
-    folders_raw = st.text_input("Create these folders inside each bucket (comma-separated, optional)", value="", key="bkt_folders")
-    # Optional: add fully custom bucket names (comma-separated)
-    extra_full_buckets_raw = st.text_input("Additional full bucket names (comma-separated, optional)", value="", key="bkt_extra_full")
-
-    def base_name_for(xc: str) -> str:
-        return f"{org_prefix_b}-{env_b.lower()}-{mid_tokens_b}-{xc}-{index_token_b}-bucket"
-
-    # Build list
-    suffixes = [s.strip() for s in extra_suffixes_raw.split(",") if s.strip()]
-    folders = [f.strip().strip("/").replace("\\", "/") for f in folders_raw.split(",") if f.strip()]
-    buckets: List[str] = []
-
-    selected_xc = []
-    if want_bc_b: selected_xc.append("bc")
-    if want_cc_b: selected_xc.append("cc")
-    if want_pc_b: selected_xc.append("pc")
-
-    for xc in selected_xc:
-        base = base_name_for(xc)
-        buckets.append(base)
-        for suf in suffixes:
-            buckets.append(f"{base}-{suf}")
-
-    # include any extra full names the user typed
-    extra_full = [b.strip() for b in extra_full_buckets_raw.split(",") if b.strip()]
-    buckets.extend(extra_full)
-
-    # Preview unique list (preserve order)
-    seen = set()
-    preview = []
-    for b in buckets:
-        if b not in seen:
-            seen.add(b); preview.append(b)
-
-    st.code("\n".join(preview) if preview else "—", language="text")
-
-    # Create buckets (+folders)
-    if st.button("Create Buckets", key="bkt_create_btn"):
-        if not HAS_BOTO3:
-            st.error("boto3 is not available here.")
-        elif not (aws_access_key and aws_secret_key):
-            st.error("Enter AWS Access Key ID and Secret Access Key.")
-        elif not preview:
-            st.error("No bucket names to create.")
-        else:
-            try:
-                session = boto3.session.Session(
-                    aws_access_key_id=aws_access_key,
-                    aws_secret_access_key=aws_secret_key,
-                    region_name=region
-                )
-                s3 = session.client("s3")
-                created = []
-                for bn in preview:
-                    cfg = {} if region == "us-east-1" else {"LocationConstraint": region}
-                    try:
-                        if region == "us-east-1":
-                            s3.create_bucket(Bucket=bn)
-                        else:
-                            s3.create_bucket(Bucket=bn, CreateBucketConfiguration=cfg)
-                        created.append(bn)
-                    except ClientError as ce:
-                        code = ce.response.get("Error", {}).get("Code")
-                        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
-                            created.append(f"{bn} (already exists)")
-                        else:
-                            raise
-                    # create folders as zero-byte keys ending with '/'
-                    for folder in folders:
-                        key = folder.rstrip("/") + "/"
-                        try:
-                            s3.put_object(Bucket=bn, Key=key)
-                        except Exception:
-                            pass
-                st.success("Buckets created / verified:\n" + "\n".join(created) + (("\nFolders created: " + ", ".join(folders)) if folders else ""))
-            except Exception as e:
-                st.error(f"Bucket creation failed: {e}")
-
-    st.markdown("---")
-    st.subheader("Delete Files from Buckets (safe cleanup)")
-
-    # choose specific buckets to clean
-    buckets_for_cleanup = st.multiselect("Select buckets to clean up", options=preview, default=preview, key="bkt_cleanup_select")
-    del_prefix = st.text_input("Prefix to delete (e.g. '', 'manifest.json', 'folder/'). Empty = everything", value="", key="bkt_del_prefix")
-    del_dryrun = st.checkbox("Dry-run (show what would be deleted, do not delete)", value=True, key="bkt_del_dry")
-
-    if st.button("Delete Objects", key="bkt_delete_btn"):
-        if not HAS_BOTO3:
-            st.error("boto3 is not available here.")
-        elif not (aws_access_key and aws_secret_key):
-            st.error("Enter AWS Access Key ID and Secret Access Key.")
-        elif not buckets_for_cleanup:
-            st.error("Choose at least one bucket to clean up.")
-        else:
-            try:
-                session = boto3.session.Session(
-                    aws_access_key_id=aws_access_key,
-                    aws_secret_access_key=aws_secret_key,
-                    region_name=region
-                )
-                s3 = session.client("s3")
-                report = []
-                for bn in buckets_for_cleanup:
-                    deleted_total = 0
-                    listed_total = 0
-                    continuation = None
-                    while True:
-                        kwargs = {"Bucket": bn}
-                        if del_prefix:
-                            kwargs["Prefix"] = del_prefix
-                        if continuation:
-                            kwargs["ContinuationToken"] = continuation
-                        resp = s3.list_objects_v2(**kwargs)
-                        objects = resp.get("Contents", [])
-                        listed_total += len(objects)
-                        if objects and not del_dryrun:
-                            to_delete = [{"Key": o["Key"]} for o in objects]
-                            # delete in batches of <= 1000
-                            for i in range(0, len(to_delete), 1000):
-                                s3.delete_objects(Bucket=bn, Delete={"Objects": to_delete[i:i+1000]})
-                            deleted_total += len(objects)
-                        if not resp.get("IsTruncated"):
-                            break
-                        continuation = resp.get("NextContinuationToken")
-                    if del_dryrun:
-                        report.append(f"{bn}: would match {listed_total} object(s) under prefix '{del_prefix}'")
-                    else:
-                        report.append(f"{bn}: deleted {deleted_total} object(s) under prefix '{del_prefix}'")
-                if del_dryrun:
-                    st.info("\n".join(report))
-                else:
-                    st.success("\n".join(report))
-            except Exception as e:
-                st.error(f"Delete failed: {e}")
-
-# ==== Users helpers ====
-
-def _gen_temp_password(length: int = 20) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
-    # ensure at least one of each class
-    pwd = [
-        secrets.choice(string.ascii_lowercase),
-        secrets.choice(string.ascii_uppercase),
-        secrets.choice(string.digits),
-        secrets.choice("!@#$%^&*()-_=+"),
-    ] + [secrets.choice(alphabet) for _ in range(length - 4)]
-    secrets.SystemRandom().shuffle(pwd)
-    return "".join(pwd)
-
-def create_or_update_user_simple(
-    conn,
-    user: str,
-    *,
-    login_name: Optional[str] = None,
-    display_name: Optional[str] = None,
-    email: Optional[str] = None,
-    default_role: Optional[str] = None,
-    default_wh: Optional[str] = None,
-    default_db: Optional[str] = None,
-    default_schema: Optional[str] = None,
-    network_policy: Optional[str] = None,
-    disabled: bool = False,
-    auth_mode: str = "SSO",  # "SSO" | "TEMP_PASSWORD" | "RSA"
-    rsa_public_key: Optional[str] = None,
-    temp_password: Optional[str] = None,
-    must_change_password: bool = True,
-) -> Optional[str]:
-    """
-    Returns the generated temporary password if auth_mode='TEMP_PASSWORD' and we generated one.
-    """
-    ident_user = sql_ident(user)
-    props = []
-    if login_name:      props.append(f"LOGIN_NAME = '{login_name}'")
-    if display_name:    props.append(f"DISPLAY_NAME = '{display_name}'")
-    if email:           props.append(f"EMAIL = '{email}'")
-    if default_role:    props.append(f"DEFAULT_ROLE = {sql_ident(default_role)}")
-    if default_wh:      props.append(f"DEFAULT_WAREHOUSE = {sql_ident(default_wh)}")
-    if default_db and default_schema:
-        props.append(f"DEFAULT_NAMESPACE = {sql_ident(default_db)}.{sql_ident(default_schema)}")
-    if network_policy:  props.append(f"NETWORK_POLICY = {sql_ident(network_policy)}")
-    props.append(f"DISABLED = {'TRUE' if disabled else 'FALSE'}")
-
-    # Auth handling
-    generated_pwd = None
-    if auth_mode == "TEMP_PASSWORD":
-        if not temp_password:
-            generated_pwd = _gen_temp_password()
-            pwd = generated_pwd
-        else:
-            pwd = temp_password
-        props.append(f"PASSWORD = '{pwd}'")
-        props.append(f"MUST_CHANGE_PASSWORD = {'TRUE' if must_change_password else 'FALSE'}")
-    elif auth_mode == "RSA":
-        if rsa_public_key:
-            props.append(f"RSA_PUBLIC_KEY = '{rsa_public_key.strip()}'")
-        else:
-            raise ValueError("RSA auth selected but no RSA public key provided.")
-    else:
-        # SSO/no credentials -> do nothing; user will sign in via IdP.
-        pass
-
-    with conn.cursor() as cur:
-        # Try CREATE, fallback to ALTER (Snowflake USER lacks IF NOT EXISTS)
-        try:
-            cur.execute(f"CREATE USER {ident_user} " + " ".join(props))
-        except Exception:
-            cur.execute(f"ALTER USER {ident_user} SET " + ", ".join(props))
-
-    return generated_pwd
-
-def grant_roles_to_user(conn, roles: list[str], user: str):
-    with conn.cursor() as cur:
-        for r in roles:
-            cur.execute(f"GRANT ROLE {sql_ident(r)} TO USER {sql_ident(user)}")
-
-def grant_schema_usage_current_and_future(conn, user: str, dbs: list[str]):
-    """
-    Grants USAGE on ALL existing and FUTURE schemas in each DB directly to the user.
-    """
-    stmts = []
-    for db in dbs:
-        dbi = sql_ident(db)
-        stmts.append(f"GRANT USAGE ON ALL SCHEMAS IN DATABASE {dbi} TO USER {sql_ident(user)}")
-        stmts.append(f"GRANT USAGE ON FUTURE SCHEMAS IN DATABASE {dbi} TO USER {sql_ident(user)}")
-    ok, fail = exec_sqls(conn, stmts)
-    return ok, fail
 
 # ===== Ownership transfer helpers =====
 def build_transfer_ownership_sql(db_name: str, new_owner_role: str = "PROD_SYSADMIN") -> List[str]:
@@ -1849,6 +1997,374 @@ with tab_ownership:
                                 st.json(out)
                     except Exception as e:
                         st.error(f"Check failed: {e}")
+
+# -------------------------
+# Delete Environment (ENV-aware + Dry-run)
+# -------------------------
+
+with tab_delete:
+    st.subheader("Danger Zone: Delete Environment (ENV + Xcenters)")
+    st.caption("Build a DROP plan based on DEV/QA and selected xcenters. Review carefully before executing.")
+
+    del_dry_run = st.checkbox("Dry-run (preview only — do not execute)", value=True, key="del_dry_run")
+    env = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="del_env")
+    env_upper = env.upper()
+
+    st.markdown("**Select xcenters to delete**")
+    del_bc = st.checkbox("BC", value=False, key="del_bc")
+    del_cc = st.checkbox("CC", value=False, key="del_cc")
+    del_pc = st.checkbox("PC", value=False, key="del_pc")
+    centers = [c for c, flag in [("BC", del_bc), ("CC", del_cc), ("PC", del_pc)] if flag]
+
+    st.divider()
+
+    st.markdown("**Base DB names (editable)**")
+    coln1, coln2, coln3 = st.columns(3)
+    with coln1:
+        base_bc = st.text_input("BC → DB basename", value="BILLING", key="del_db_bc")
+    with coln2:
+        base_cc = st.text_input("CC → DB basename", value="CLAIMS", key="del_db_cc")
+    with coln3:
+        base_pc = st.text_input("PC → DB basename", value="POLICY", key="del_db_pc")
+
+    st.markdown("**Stage locations in Snowflake**")
+    del_db_for_stages = st.text_input("Database that holds S3 stages", value=f"AQS_{env_upper}", key="del_stage_db")
+    del_stage_schema   = st.text_input("Stage schema", value="STG", key="del_stage_schema")
+    stage_names = {"BC": "S3_LZ_BC", "CC": "S3_LZ_CC", "PC": "S3_LZ_PC"}
+
+    st.markdown("**Storage Integration**")
+    drop_integration = st.checkbox("Also drop the STORAGE INTEGRATION for this env", value=False, key="del_drop_integ")
+    integ_name = st.text_input("Integration name", value=f"AQS_S3_INT_{env_upper}", key="del_integ_name")
+
+    st.markdown("**Roles (optional)**")
+    drop_roles = st.checkbox("Drop app roles?", value=False, key="del_drop_roles")
+    roles_raw = st.text_input("Roles to drop (comma-separated)", value="AQS_APP_READER, AQS_APP_WRITER, AQS_APP_ADMIN", key="del_roles_raw")
+
+    st.markdown("**Warehouses**")
+    drop_wh = st.checkbox("Drop warehouses for selected xcenters", value=True, key="del_drop_wh")
+
+    st.divider()
+
+    # NEW: execution role + neutral DB option
+    exec_role_for_drop = st.text_input("Execution role for DROP", value="PROD_SYSADMIN", key="del_exec_role")
+    also_use_neutral_db = st.checkbox("Switch to neutral database before dropping (recommended)", value=True, key="del_use_neutral_db")
+
+    confirm_text = st.text_input("Type the environment name to confirm (DEV, QA, or STG)", key="del_confirm_text")
+
+    if st.button("Build DROP Plan", key="del_build_btn"):
+        if not centers:
+            st.error("Select at least one xcenter.")
+        else:
+            plan_drop: List[str] = []
+            for c in centers:
+                stg = stage_names[c]
+                plan_drop.append(
+                    f"DROP STAGE IF EXISTS {sql_ident(del_db_for_stages)}.{sql_ident(del_stage_schema)}.{sql_ident(stg)};"
+                )
+            if drop_integration and integ_name.strip():
+                plan_drop.append(f"DROP INTEGRATION IF EXISTS {sql_ident(integ_name.strip())};")
+
+            base_map = {"BC": base_bc, "CC": base_cc, "PC": base_pc}
+            for c in centers:
+                db_name = f"{base_map[c]}_AQS_{env_upper}".upper()
+                plan_drop.append(f"DROP DATABASE IF EXISTS {sql_ident(db_name)};")
+
+            if drop_wh:
+                for c in centers:
+                    wh_ident = f'IDENTIFIER(\'"WH_DATA_ENGNR_SML_{c}_AQS_{env_upper}"\')'
+                    plan_drop.append(f"DROP WAREHOUSE IF EXISTS {wh_ident};")
+
+            if drop_roles:
+                for r in [x.strip() for x in roles_raw.split(",") if x.strip()]:
+                    plan_drop.append(f"DROP ROLE IF EXISTS {sql_ident(r)};")
+
+            st.session_state.plan_drop = plan_drop
+            nice_panel("DROP Plan", "\n".join(plan_drop))
+
+            if confirm_text.strip().upper() != env_upper:
+                st.warning(f"Type **{env_upper}** in the confirmation box to enable execution.")
+            if del_dry_run:
+                st.info("Dry-run is ON: execution is disabled. Review the plan above.")
+            else:
+                st.success("Dry-run is OFF. You can execute the DROP plan below once confirmation matches.")
+
+    if st.session_state.get("plan_drop"):
+        can_execute = confirm_text.strip().upper() == env_upper and not del_dry_run
+        if can_execute:
+            if st.button("Execute DROP Plan (Irreversible)", type="primary", key="del_exec_btn"):
+                try:
+                    with get_conn() as conn:
+                        # Switch to the role that owns the objects (e.g., PROD_SYSADMIN)
+                        try:
+                            set_role(conn, exec_role_for_drop)
+                        except Exception as e:
+                            st.error(f"Could not switch to role {exec_role_for_drop}: {e}")
+                            raise
+
+                        # Optional: move to a neutral DB to avoid “in-use” issues when dropping target DBs
+                        if also_use_neutral_db:
+                            with conn.cursor() as cur:
+                                # SNOWFLAKE database is always present
+                                cur.execute("USE DATABASE SNOWFLAKE")
+
+                        cur = conn.cursor()
+                        success, failures = run_multi_sql(cur, st.session_state.plan_drop)
+
+                    st.session_state.audit = {"success": success, "failures": failures}
+                    if failures:
+                        st.warning("Completed with errors. DDL is auto-committed; some actions may already have applied.")
+                    else:
+                        st.success(f"{env_upper}: Selected xcenter environment objects dropped successfully.")
+                except Exception as e:
+                    st.error(f"Execution failed: {e}")
+        else:
+            if del_dry_run:
+                st.info("Execution disabled because Dry-run is ON.")
+            else:
+                st.info("Execution disabled until the confirmation text matches the environment (DEV, QA, or STG).")
+
+# -------------------------
+# Optional: Create / Delete S3 landing buckets & files
+# -------------------------
+with tab_buckets:
+    st.subheader("Create / Delete S3 Landing Buckets (optional)")
+
+    if not HAS_BOTO3:
+        st.warning("boto3 not installed in this environment. Install boto3 to enable S3 operations.")
+
+    region = st.text_input("AWS Region", value="us-east-1", key="bkt_region")
+    aws_access_key = st.text_input("AWS Access Key ID", value="", key="bkt_key")
+    aws_secret_key = st.text_input("AWS Secret Access Key", value="", type="password", key="bkt_secret")
+
+    env_b = st.radio("Environment", ["DEV", "QA", "STG"], index=0, horizontal=True, key="bkt_env")
+    org_prefix_b = st.text_input("Org prefix", value="cig", key="bkt_org")
+    mid_tokens_b = st.text_input("Middle tokens", value="env-aqs-gw-landing-zone", key="bkt_mid")
+    index_token_b = st.text_input("Index token", value="01", key="bkt_idx")
+
+    want_bc_b = st.checkbox("BC", value=True, key="bkt_bc")
+    want_cc_b = st.checkbox("CC", value=True, key="bkt_cc")
+    want_pc_b = st.checkbox("PC", value=True, key="bkt_pc")
+
+    def base_name_for(xc: str) -> str:
+        return f"{org_prefix_b}-{env_b.lower()}-{mid_tokens_b}-{xc}-{index_token_b}-bucket"
+
+    suffixes = [s.strip() for s in st.text_input("Extra bucket suffixes (comma-separated, appended as -<suffix>)", value="archive", key="bkt_suffixes").split(",") if s.strip()]
+    folders = [f.strip().strip("/").replace("\\", "/") for f in st.text_input("Create these folders inside each bucket (comma-separated, optional)", value="", key="bkt_folders").split(",") if f.strip()]
+    extra_full = [b.strip() for b in st.text_input("Additional full bucket names (comma-separated, optional)", value="", key="bkt_extra_full").split(",") if b.strip()]
+
+    selected_xc = []
+    if want_bc_b: selected_xc.append("bc")
+    if want_cc_b: selected_xc.append("cc")
+    if want_pc_b: selected_xc.append("pc")
+
+    buckets: List[str] = []
+    for xc in selected_xc:
+        base = base_name_for(xc)
+        buckets.append(base)
+        for suf in suffixes:
+            buckets.append(f"{base}-{suf}")
+    buckets.extend(extra_full)
+
+    # Preview unique list
+    seen = set(); preview = []
+    for b in buckets:
+        if b not in seen:
+            seen.add(b); preview.append(b)
+    st.code("\n".join(preview) if preview else "—", language="text")
+
+    if st.button("Create Buckets", key="bkt_create_btn"):
+        if not HAS_BOTO3:
+            st.error("boto3 is not available here.")
+        elif not (aws_access_key and aws_secret_key):
+            st.error("Enter AWS Access Key ID and Secret Access Key.")
+        elif not preview:
+            st.error("No bucket names to create.")
+        else:
+            try:
+                session = boto3.session.Session(
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                    region_name=region
+                )
+                s3 = session.client("s3")
+                created = []
+                for bn in preview:
+                    cfg = {} if region == "us-east-1" else {"LocationConstraint": region}
+                    try:
+                        if region == "us-east-1":
+                            s3.create_bucket(Bucket=bn)
+                        else:
+                            s3.create_bucket(Bucket=bn, CreateBucketConfiguration=cfg)
+                        created.append(bn)
+                    except ClientError as ce:
+                        code = ce.response.get("Error", {}).get("Code")
+                        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                            created.append(f"{bn} (already exists)")
+                        else:
+                            raise
+                    for folder in folders:
+                        key = folder.rstrip("/") + "/"
+                        try:
+                            s3.put_object(Bucket=bn, Key=key)
+                        except Exception:
+                            pass
+                st.success("Buckets created / verified:\n" + "\n".join(created) + (("\nFolders created: " + ", ".join(folders)) if folders else ""))
+            except Exception as e:
+                st.error(f"Bucket creation failed: {e}")
+
+    st.markdown("---")
+    st.subheader("Delete Files from Buckets (safe cleanup)")
+
+    buckets_for_cleanup = st.multiselect("Select buckets to clean up", options=preview, default=preview, key="bkt_cleanup_select")
+    del_prefix = st.text_input("Prefix to delete (e.g. '', 'manifest.json', 'folder/'). Empty = everything", value="", key="bkt_del_prefix")
+    del_dryrun = st.checkbox("Dry-run (show what would be deleted, do not delete)", value=True, key="bkt_del_dry")
+
+    if st.button("Delete Objects", key="bkt_delete_btn"):
+        if not HAS_BOTO3:
+            st.error("boto3 is not available here.")
+        elif not (aws_access_key and aws_secret_key):
+            st.error("Enter AWS Access Key ID and Secret Access Key.")
+        elif not buckets_for_cleanup:
+            st.error("Choose at least one bucket to clean up.")
+        else:
+            try:
+                session = boto3.session.Session(
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                    region_name=region
+                )
+                s3 = session.client("s3")
+                report = []
+                for bn in buckets_for_cleanup:
+                    deleted_total = 0
+                    listed_total = 0
+                    continuation = None
+                    while True:
+                        kwargs = {"Bucket": bn}
+                        if del_prefix:
+                            kwargs["Prefix"] = del_prefix
+                        if continuation:
+                            kwargs["ContinuationToken"] = continuation
+                        resp = s3.list_objects_v2(**kwargs)
+                        objects = resp.get("Contents", [])
+                        listed_total += len(objects)
+                        if objects and not del_dryrun:
+                            to_delete = [{"Key": o["Key"]} for o in objects]
+                            for i in range(0, len(to_delete), 1000):
+                                s3.delete_objects(Bucket=bn, Delete={"Objects": to_delete[i:i+1000]})
+                            deleted_total += len(objects)
+                        if not resp.get("IsTruncated"):
+                            break
+                        continuation = resp.get("NextContinuationToken")
+                    if del_dryrun:
+                        report.append(f"{bn}: would match {listed_total} object(s) under prefix '{del_prefix}'")
+                    else:
+                        report.append(f"{bn}: deleted {deleted_total} object(s) under prefix '{del_prefix}'")
+                if del_dryrun:
+                    st.info("\n".join(report))
+                else:
+                    st.success("\n".join(report))
+            except Exception as e:
+                st.error(f"Delete failed: {e}")
+
+# -------------------------
+# CDA Access Check Tab
+# -------------------------
+with tab_cda_tab:
+    tab_cda_access_check()
+
+
+
+def _gen_temp_password(length: int = 20) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    # ensure at least one of each class
+    pwd = [
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.digits),
+        secrets.choice("!@#$%^&*()-_=+"),
+    ] + [secrets.choice(alphabet) for _ in range(length - 4)]
+    secrets.SystemRandom().shuffle(pwd)
+    return "".join(pwd)
+
+def create_or_update_user_simple(
+    conn,
+    user: str,
+    *,
+    login_name: Optional[str] = None,
+    display_name: Optional[str] = None,
+    email: Optional[str] = None,
+    default_role: Optional[str] = None,
+    default_wh: Optional[str] = None,
+    default_db: Optional[str] = None,
+    default_schema: Optional[str] = None,
+    network_policy: Optional[str] = None,
+    disabled: bool = False,
+    auth_mode: str = "SSO",  # "SSO" | "TEMP_PASSWORD" | "RSA"
+    rsa_public_key: Optional[str] = None,
+    temp_password: Optional[str] = None,
+    must_change_password: bool = True,
+) -> Optional[str]:
+    """
+    Returns the generated temporary password if auth_mode='TEMP_PASSWORD' and we generated one.
+    """
+    ident_user = sql_ident(user)
+    props = []
+    if login_name:      props.append(f"LOGIN_NAME = '{login_name}'")
+    if display_name:    props.append(f"DISPLAY_NAME = '{display_name}'")
+    if email:           props.append(f"EMAIL = '{email}'")
+    if default_role:    props.append(f"DEFAULT_ROLE = {sql_ident(default_role)}")
+    if default_wh:      props.append(f"DEFAULT_WAREHOUSE = {sql_ident(default_wh)}")
+    if default_db and default_schema:
+        props.append(f"DEFAULT_NAMESPACE = {sql_ident(default_db)}.{sql_ident(default_schema)}")
+    if network_policy:  props.append(f"NETWORK_POLICY = {sql_ident(network_policy)}")
+    props.append(f"DISABLED = {'TRUE' if disabled else 'FALSE'}")
+
+    # Auth handling
+    generated_pwd = None
+    if auth_mode == "TEMP_PASSWORD":
+        if not temp_password:
+            generated_pwd = _gen_temp_password()
+            pwd = generated_pwd
+        else:
+            pwd = temp_password
+        props.append(f"PASSWORD = '{pwd}'")
+        props.append(f"MUST_CHANGE_PASSWORD = {'TRUE' if must_change_password else 'FALSE'}")
+    elif auth_mode == "RSA":
+        if rsa_public_key:
+            props.append(f"RSA_PUBLIC_KEY = '{rsa_public_key.strip()}'")
+        else:
+            raise ValueError("RSA auth selected but no RSA public key provided.")
+    else:
+        # SSO/no credentials -> do nothing; user will sign in via IdP.
+        pass
+
+    with conn.cursor() as cur:
+        # Try CREATE, fallback to ALTER (Snowflake USER lacks IF NOT EXISTS)
+        try:
+            cur.execute(f"CREATE USER {ident_user} " + " ".join(props))
+        except Exception:
+            cur.execute(f"ALTER USER {ident_user} SET " + ", ".join(props))
+
+    return generated_pwd
+
+def grant_roles_to_user(conn, roles: list[str], user: str):
+    with conn.cursor() as cur:
+        for r in roles:
+            cur.execute(f"GRANT ROLE {sql_ident(r)} TO USER {sql_ident(user)}")
+
+def grant_schema_usage_current_and_future(conn, user: str, dbs: list[str]):
+    """
+    Grants USAGE on ALL existing and FUTURE schemas in each DB directly to the user.
+    """
+    stmts = []
+    for db in dbs:
+        dbi = sql_ident(db)
+        stmts.append(f"GRANT USAGE ON ALL SCHEMAS IN DATABASE {dbi} TO USER {sql_ident(user)}")
+        stmts.append(f"GRANT USAGE ON FUTURE SCHEMAS IN DATABASE {dbi} TO USER {sql_ident(user)}")
+    ok, fail = exec_sqls(conn, stmts)
+    return ok, fail    
+
 def list_users(conn, like: Optional[str] = None, limit: int = 200):
     """
     Returns rows from SHOW USERS (requires SECURITYADMIN or ACCOUNTADMIN).
@@ -2053,7 +2569,3 @@ with tab_users:
                     st.code(generated)
             except Exception as e:
                 st.error(f"User create/update failed: {e}")
-
-
-st.divider()
-st.caption("Key-pair auth with service user (CLI_USER). For S3 create/delete we use AWS Access Key/Secret via boto3. Apply least-privilege grants in production.")
