@@ -638,7 +638,7 @@ def tab_cda_access_check():
 
             import pandas as pd
             df = pd.DataFrame([r.__dict__ for r in results])[["resource", "check", "status", "details"]].sort_values(["resource", "status", "check"])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(...), width='stretch', hide_index=True)
             st.success(f"Summary — PASS: {(df.status=='PASS').sum()} • WARN: {(df.status=='WARN').sum()} • FAIL: {(df.status=='FAIL').sum()} • SKIP: {(df.status=='SKIP').sum()}")
             st.download_button("Download CSV", data=df.to_csv(index=False), file_name="cda_access_results.csv", mime="text/csv")
         else:
@@ -1711,6 +1711,69 @@ def show_grants_to_user_safer(conn, user_raw: str):
 # -------------------------
 # User Access (onrole/offrole, move, restrict DBs, viewer)
 # -------------------------
+
+def _render_effective_grants_viewer(user_input: str):
+    """Shows the Effective Grants Viewer for the given user (only when called)."""
+    st.markdown("### Effective Grants Viewer")
+
+    if st.button("Refresh Grants", key="ua_refresh_grants"):
+        u_raw = (user_input or "").strip()
+        if not u_raw:
+            st.error("Enter a user to inspect.")
+            return
+
+        # Outer try to catch connection or helper failures
+        try:
+            with get_conn() as conn:
+                grants, owner_role, err, canon_ident = show_grants_to_user_safer(conn, u_raw)
+        except Exception as e:
+            st.error(f"Failed to check grants: {e}")
+            return
+
+        if grants:
+            with st.expander(f"Raw SHOW GRANTS TO USER {canon_ident or u_raw}", expanded=False):
+                st.json(grants)
+            db_usage    = [g for g in grants if (g.get("granted_on","").upper() == "DATABASE")]
+            role_grants = [g for g in grants if g.get("grant_type","").upper() == "ROLE_GRANT"]
+            st.write(f"Database USAGE entries: {len(db_usage)}")
+            st.write(f"Role grants (direct/indirect): {len(role_grants)}")
+            return
+
+        # Limited-visibility path
+        msg = f"Limited visibility for **{u_raw}** — cannot run SHOW GRANTS TO USER."
+        if owner_role:
+            msg += f" Owner: **{owner_role}**."
+        st.warning(msg)
+        if err:
+            st.caption(f"Original error: {err}")
+
+        # Offer retry with discovered OWNER role
+        if owner_role:
+            c1, c2 = st.columns([1,3])
+            with c1:
+                if st.button(f"Try with role: {owner_role}", key="ua_retry_owner"):
+                    try:
+                        with get_conn() as conn2:
+                            set_role(conn2, owner_role)
+                            grants2, _, err2, canon2 = show_grants_to_user_safer(conn2, u_raw)
+                    except Exception as e2:
+                        st.error(f"Retry failed: {e2}")
+                    else:
+                        if grants2:
+                            with st.expander(f"Raw SHOW GRANTS TO USER {canon2 or u_raw}", expanded=False):
+                                st.json(grants2)
+                            db_usage2    = [g for g in grants2 if (g.get("granted_on","").upper() == "DATABASE")]
+                            role_grants2 = [g for g in grants2 if g.get("grant_type","").upper() == "ROLE_GRANT"]
+                            st.success(f"Loaded grants with role {owner_role}.")
+                            st.write(f"Database USAGE entries: {len(db_usage2)}")
+                            st.write(f"Role grants (direct/indirect): {len(role_grants2)}")
+                        else:
+                            st.info("Still limited. You may need SECURITYADMIN or ACCOUNTADMIN.")
+                            if err2:
+                                st.caption(f"Original error: {err2}")
+            with c2:
+                st.caption("Tip: You can also use the **Session Role** controls above to switch roles, then click Refresh again.")
+
 with tab_user_access:
     st.subheader("User Access")
 
@@ -1723,6 +1786,7 @@ with tab_user_access:
     if not user_input:
         st.info("Enter a user to manage.")
     else:
+        # --- Session Role ---
         st.markdown("### Session Role")
         colr1, colr2, colr3 = st.columns([2,1,1])
         with colr1:
@@ -1746,6 +1810,7 @@ with tab_user_access:
 
         st.divider()
 
+        # --- Move user between roles ---
         st.markdown("### Move User Between Roles")
         c3, c4, c5 = st.columns([2,2,2])
         with c3:
@@ -1780,6 +1845,7 @@ with tab_user_access:
 
         st.divider()
 
+        # --- Restrict to DB allowlist ---
         st.markdown("### Restrict Access to Selected Databases")
         try:
             with get_conn() as conn:
@@ -1799,12 +1865,14 @@ with tab_user_access:
                         grants, revokes = ensure_db_allowlist(conn, user_input, set(allowed), dry_run=dry_run)
                     st.write("**Planned GRANTs:**" if dry_run else "**Executed GRANTs:**")
                     if grants:
-                        for g in grants: st.code(g)
+                        for g in grants:
+                            st.code(g)
                     else:
                         st.caption("No GRANTs needed.")
                     st.write("**Planned REVOKEs:**" if dry_run else "**Executed REVOKEs:**")
                     if revokes:
-                        for r in revokes: st.code(r)
+                        for r in revokes:
+                            st.code(r)
                     else:
                         st.caption("No REVOKEs needed.")
                     if not dry_run:
@@ -1814,62 +1882,8 @@ with tab_user_access:
 
         st.divider()
 
-# --- Effective privileges viewer (SAFER) ---
-st.markdown("### Effective Grants Viewer")
-
-if st.button("Refresh Grants", key="ua_refresh_grants"):
-    u_raw = (user_input or "").strip()
-    if not u_raw:
-        st.error("Enter a user to inspect.")
-    else:
-        # Outer try to catch connection or helper failures
-        try:
-            with get_conn() as conn:
-                grants, owner_role, err, canon_ident = show_grants_to_user_safer(conn, u_raw)
-        except Exception as e:
-            st.error(f"Failed to check grants: {e}")
-        else:
-            if grants:
-                with st.expander(f"Raw SHOW GRANTS TO USER {canon_ident or u_raw}", expanded=False):
-                    st.json(grants)
-                db_usage   = [g for g in grants if (g.get("granted_on","").upper() == "DATABASE")]
-                role_grants = [g for g in grants if g.get("grant_type","").upper() == "ROLE_GRANT"]
-                st.write(f"Database USAGE entries: {len(db_usage)}")
-                st.write(f"Role grants (direct/indirect): {len(role_grants)}")
-            else:
-                msg = f"Limited visibility for **{u_raw}** — cannot run SHOW GRANTS TO USER."
-                if owner_role:
-                    msg += f" Owner: **{owner_role}**."
-                st.warning(msg)
-                if err:
-                    st.caption(f"Original error: {err}")
-
-                # Offer retry with discovered OWNER role
-                if owner_role:
-                    c1, c2 = st.columns([1,3])
-                    with c1:
-                        if st.button(f"Try with role: {owner_role}", key="ua_retry_owner"):
-                            try:
-                                with get_conn() as conn2:
-                                    set_role(conn2, owner_role)
-                                    grants2, _, err2, canon2 = show_grants_to_user_safer(conn2, u_raw)
-                            except Exception as e2:
-                                st.error(f"Retry failed: {e2}")
-                            else:
-                                if grants2:
-                                    with st.expander(f"Raw SHOW GRANTS TO USER {canon2 or u_raw}", expanded=False):
-                                        st.json(grants2)
-                                    db_usage2   = [g for g in grants2 if (g.get("granted_on","").upper() == "DATABASE")]
-                                    role_grants2 = [g for g in grants2 if g.get("grant_type","").upper() == "ROLE_GRANT"]
-                                    st.success(f"Loaded grants with role {owner_role}.")
-                                    st.write(f"Database USAGE entries: {len(db_usage2)}")
-                                    st.write(f"Role grants (direct/indirect): {len(role_grants2)}")
-                                else:
-                                    st.info("Still limited. You may need SECURITYADMIN or ACCOUNTADMIN.")
-                                    if err2:
-                                        st.caption(f"Original error: {err2}")
-                    with c2:
-                        st.caption("Tip: You can also use the **Session Role** controls above to switch roles, then click Refresh again.")
+        # --- Effective Grants Viewer (ONLY in this tab) ---
+        _render_effective_grants_viewer(user_input)
 
 
 # -------------------------
@@ -2905,3 +2919,52 @@ with tab_users:
                     st.code(generated)
             except Exception as e:
                 st.error(f"User create/update failed: {e}")
+
+# --- Optional sticky footer ---
+def render_footer(
+    app_version: str = "v1.3.0",
+    build: str = "2025-10-21",
+    commit: str = "internal",
+):
+    acct = st.session_state.get("account", "—")
+    user = st.session_state.get("user", "—")
+    role = st.session_state.get("role", "—")
+    wh   = st.session_state.get("warehouse", "—")
+
+    st.markdown("""
+        <style>
+        .sf-footer {
+            position: sticky; bottom: -1px; z-index: 50;
+            margin: 2rem -1rem -1rem -1rem;
+            background: var(--secondary-background-color);
+            border-top: 1px solid rgba(49,51,63,.15);
+            padding: 10px 14px; font-size: .85rem;
+        }
+        .sf-footer .pill {
+            display: inline-block;
+            padding: 2px 8px; border-radius: 999px;
+            border: 1px solid rgba(49,51,63,.2);
+            margin-right: 6px;
+        }
+        @media (prefers-color-scheme: dark){
+            .sf-footer{ border-top-color: rgba(250,250,250,.15); }
+            .sf-footer .pill{ border-color: rgba(250,250,250,.2); }
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        f"""
+        <div class="sf-footer">
+            <span class="pill">App {app_version}</span>
+            <span class="pill">Build {build}</span>
+            <span class="pill">Account: {acct}</span>
+            <span class="pill">User: {user}</span>
+            <span class="pill">Role: {role}</span>
+            <span class="pill">WH: {wh}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+render_footer()
