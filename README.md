@@ -398,9 +398,6 @@ render_footer(app_version="v1.3.0", build="2025-10-17")
 ---
 
 ## 🧭 Suggested Header
-Use a clear product title:
-- **❄️ Snowflake and AWS Orchestrator**
-
 Optional right-aligned “About / Docs” links:
 - Snowflake Docs | AWS Docs | Help
 
