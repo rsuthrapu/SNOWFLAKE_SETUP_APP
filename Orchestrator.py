@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 import os
 import configparser
+from types import SimpleNamespace
+from types import SimpleNamespace as _NS
 
 # Optional: S3 / Glue
 try:
@@ -494,6 +496,31 @@ def _build_copy_plan(env_src: str, env_dst: str, xcenters: list[str], load_types
                 env_dst=env_dst.upper(),
             ))
     return plan
+
+
+def _list_s3_keys(s3, bucket: str, prefix: str, suffixes: list[str] | None = None, limit: int = 2000) -> list[str]:
+    """List object keys under prefix; optional suffix filter; paginated."""
+    keys, token = [], None
+    fetched = 0
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            k = obj["Key"]
+            if suffixes:
+                if not any(k.lower().endswith(s.lower()) for s in suffixes):
+                    continue
+            keys.append(k)
+            fetched += 1
+            if fetched >= limit:
+                return keys
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return keys
+
 def tab_cda_access_check():
     st.subheader("CDA Access Check")
     st.caption("Validate Guidewire CDA S3 access and copy/rename Glue scripts across environments.")
@@ -685,6 +712,24 @@ def tab_cda_access_check():
             except Exception as e:
                 st.warning(f"Could not save DST profile: {e}")
 
+        # Convenience: use source credentials for destination
+        st.markdown("#### Auth convenience")
+        col_ca, col_cb = st.columns([1,2])
+        with col_ca:
+            if st.button("Use source credentials for destination", key="glue_copy_creds_btn", use_container_width=True):
+                # mirror auth mode
+                st.session_state["glue_auth_dst"] = auth_src
+                if auth_src == "Profile":
+                    st.session_state["glue_profile_dst"] = profile_src
+                    st.success("Destination now uses the same profile as Source.")
+                else:
+                    st.session_state["glue_ak_dst"] = ak_src or ""
+                    st.session_state["glue_sk_dst"] = sk_src or ""
+                    st.session_state["glue_tk_dst"] = tk_src or ""
+                    st.success("Destination now uses the same access key / secret / session token as Source.")
+        with col_cb:
+            st.caption("Mirror Source → Destination (works for Profile or Access keys). You can still AssumeRole/ExternalId per side.")
+
         # Build sessions
         try:
             sess_src = _make_session(
@@ -696,14 +741,21 @@ def tab_cda_access_check():
                 secret_key=sk_src if auth_src == "Access keys" else None,
                 session_token=tk_src if auth_src == "Access keys" else None,
             )
+            # pick possibly mirrored values for destination from session_state (if button pressed)
+            eff_auth_dst = st.session_state.get("glue_auth_dst", auth_dst)
+            eff_profile_dst = st.session_state.get("glue_profile_dst", profile_dst if auth_dst=="Profile" else None)
+            eff_ak_dst = st.session_state.get("glue_ak_dst", ak_dst if auth_dst=="Access keys" else None)
+            eff_sk_dst = st.session_state.get("glue_sk_dst", sk_dst if auth_dst=="Access keys" else None)
+            eff_tk_dst = st.session_state.get("glue_tk_dst", tk_dst if auth_dst=="Access keys" else None)
+
             sess_dst = _make_session(
-                profile=profile_dst if auth_dst == "Profile" else None,
+                profile=eff_profile_dst if eff_auth_dst == "Profile" else None,
                 region=region_g,
                 role_arn=role_dst or None,
                 external_id=external_id or None,
-                access_key=ak_dst if auth_dst == "Access keys" else None,
-                secret_key=sk_dst if auth_dst == "Access keys" else None,
-                session_token=tk_dst if auth_dst == "Access keys" else None,
+                access_key=eff_ak_dst if eff_auth_dst == "Access keys" else None,
+                secret_key=eff_sk_dst if eff_auth_dst == "Access keys" else None,
+                session_token=eff_tk_dst if eff_auth_dst == "Access keys" else None,
             )
             s3_src = sess_src.client("s3")
             s3_dst = sess_dst.client("s3")
@@ -733,6 +785,53 @@ def tab_cda_access_check():
             dst_prefix = st.text_input("Destination Prefix", value=DEFAULT_SCRIPT_PREFIX, key="glue_dst_prefix")
             file_stem = st.text_input("Filename Pattern", value=DEFAULT_FILE_STEM, help="Tokens: {env}, {xcenter}, {load_type}", key="glue_file_stem")
 
+        # ---- Source browser & selection ----
+        st.markdown("#### Browse Source Scripts")
+        with st.expander("Source script browser", expanded=False):
+            col_b1, col_b2, col_b3 = st.columns([2,1,1])
+            with col_b1:
+                suffix_filter = st.text_input("Filter by suffix (comma-separated)", value=".py,.sql,.scala,.json", key="glue_suffix_filter")
+            with col_b2:
+                max_list = st.number_input("Max to list", min_value=50, max_value=5000, value=1000, step=50, key="glue_max_list")
+            with col_b3:
+                do_list = st.button("List scripts", key="glue_list_btn", use_container_width=True)
+
+            if do_list:
+                suffixes = [s.strip() for s in suffix_filter.split(",") if s.strip()]
+                try:
+                    keys = _list_s3_keys(s3_src, src_bucket, src_prefix, suffixes=suffixes, limit=int(max_list))
+                except ClientError as e:
+                    st.error(f"List error: {e}")
+                    keys = []
+                st.session_state["glue_src_keys"] = keys
+
+            keys = st.session_state.get("glue_src_keys", [])
+            if keys:
+                sel = st.multiselect("Select scripts to copy", keys, default=keys[: min(10, len(keys))], key="glue_selected_keys")
+                st.caption(f"{len(sel)} selected of {len(keys)} listed")
+
+                # naming + substitution
+                name_mode = st.radio(
+                    "Destination naming",
+                    [
+                        "Keep original key name (exact)",                  # full key after dst_prefix
+                        "Preserve relative path under destination prefix", # keep path relative to src_prefix
+                        "Use filename pattern",                            # your pattern
+                    ],
+                    key="glue_dest_mode",
+                )
+                disable_subs = st.checkbox("Disable token substitution (byte-for-byte copy)", value=False, key="glue_disable_subs")
+                st.checkbox("Use selected scripts for plan/execution", value=True, key="glue_use_selected")
+
+                # Info: same env + same location (self-overwrite risk)
+                same_env = (env_src == env_dst)
+                same_location = (src_bucket == dst_bucket and src_prefix.rstrip("/") == dst_prefix.rstrip("/"))
+                if same_env and same_location:
+                    st.warning("Source and Destination are the same bucket/prefix. You may overwrite files. Consider enabling dry-run or switching naming mode.")
+            else:
+                st.info("Click **List scripts** to browse keys under the source prefix.")
+
+        # ---- Tokens ----
         st.markdown("#### Token Substitution (optional)")
         st.caption("Replaces tokens in script body on copy (e.g., {env}, {xcenter}, {load_type}, {bucket}, {prefix})")
         col_et1, col_et2 = st.columns(2)
@@ -746,6 +845,7 @@ def tab_cda_access_check():
         if token_extra1_k.strip():
             extra_tokens[token_extra1_k.strip("{} ")] = token_extra1_v.strip()
 
+        # ---- Plan & Execute ----
         st.markdown("#### Plan & Execute")
         dry_run = st.checkbox("Dry-run (preview only — do not write)", value=True, key="glue_dry")
         overwrite = st.checkbox("Overwrite if destination exists", value=False, key="glue_overwrite")
@@ -759,7 +859,44 @@ def tab_cda_access_check():
             if not load_types:
                 st.error("Select at least one load type."); return
 
-            plan = _build_copy_plan(env_src, env_dst, xcenters, load_types, src_bucket, dst_bucket, src_prefix, dst_prefix, file_stem)
+            use_selected = st.session_state.get("glue_use_selected", False)
+            selected = st.session_state.get("glue_selected_keys", []) or []
+
+            if use_selected and selected:
+                # Build a plan directly from the selected keys (supports same-env)
+                plan = []
+                for k in selected:
+                    # relative path under src_prefix
+                    rel = k[len(src_prefix):].lstrip("/") if k.startswith(src_prefix) else k
+
+                    nm = st.session_state.get("glue_dest_mode")
+                    if nm == "Keep original key name (exact)":
+                        # place the full original key string under destination prefix
+                        # e.g. src_prefix=a/b, key=a/b/x/y.py -> dst_prefix/.../a/b/x/y.py
+                        dst_key = f"{dst_prefix.rstrip('/')}/{k}"
+                    elif nm == "Preserve relative path under destination prefix":
+                        # e.g. src_prefix=a/b, key=a/b/x/y.py -> dst_prefix/.../x/y.py
+                        dst_key = f"{dst_prefix.rstrip('/')}/{rel}"
+                    else:
+                        # Use pattern (pick a representative xcenter/load_type if multiple)
+                        x_default = (xcenters or ["BC"])[0]
+                        lt_default = "INITIAL" if st.session_state.get("glue_lt_init") else "INCREMENTAL"
+                        fname = DEFAULT_FILE_STEM.format(env=env_dst, xcenter=x_default, load_type=lt_default)
+                        dst_key = f"{dst_prefix.rstrip('/')}/{fname}"
+
+                    plan.append(SimpleNamespace(
+                        env_src=env_src, env_dst=env_dst,
+                        xcenter="—", load_type="—",
+                        src_bucket=src_bucket, src_key=k,
+                        dst_bucket=dst_bucket, dst_key=dst_key,
+                        _no_subs=st.session_state.get("glue_disable_subs", False),
+                    ))
+            else:
+                # Pattern-based generator (your existing function)
+                plan = _build_copy_plan(env_src, env_dst, xcenters, load_types, src_bucket, dst_bucket, src_prefix, dst_prefix, file_stem)
+                # mark plan items for substitution (enabled by default here)
+                for item in plan:
+                    setattr(item, "_no_subs", False)
 
             import pandas as pd
             st.dataframe(pd.DataFrame([p.__dict__ for p in plan]), use_container_width=True, hide_index=True)
@@ -775,7 +912,10 @@ def tab_cda_access_check():
                     else:
                         try:
                             body = _read_s3_text(s3_src, item.src_bucket, item.src_key)
-                            body2 = _subs(body, env=item.env_dst, xcenter=item.xcenter, load_type=item.load_type, extras=extra_tokens)
+                            if getattr(item, "_no_subs", False):
+                                body2 = body  # byte-for-byte
+                            else:
+                                body2 = _subs(body, env=item.env_dst, xcenter=getattr(item, "xcenter", "—"), load_type=getattr(item, "load_type", "—"), extras=extra_tokens)
                             if _exists_s3_key(s3_dst, item.dst_bucket, item.dst_key) and not overwrite:
                                 status, detail = "SKIP", "Destination exists (overwrite disabled)"
                             else:
@@ -790,7 +930,6 @@ def tab_cda_access_check():
                             status, detail = "FAIL", f"{type(e).__name__}: {e}"
 
                     results.append({
-                        "xcenter": item.xcenter, "load_type": item.load_type,
                         "src": f"s3://{item.src_bucket}/{item.src_key}",
                         "dst": f"s3://{item.dst_bucket}/{item.dst_key}",
                         "status": status, "detail": detail
@@ -799,7 +938,6 @@ def tab_cda_access_check():
                 df_res = pd.DataFrame(results)
                 st.dataframe(df_res, use_container_width=True, hide_index=True)
                 st.download_button("Download results CSV", data=df_res.to_csv(index=False), file_name="glue_copy_results.csv")
-
 
 
 # ============ UI ============
@@ -1494,6 +1632,82 @@ END;"""
             except Exception as e:
                 st.error(f"Execution failed: {e}")
 
+
+def _canon_user_ident_from_show_row(row: dict) -> str:
+    """
+    Given a SHOW USERS row, build a canonical identifier:
+    - If name is all UPPER alnum/underscore -> unquoted (ABC)
+    - else quoted ("MixedCase" / "abc")
+    """
+    name = (row.get("name") or row.get("NAME") or "").strip()
+    if name.isupper() and name.replace("_","").isalnum():
+        return name
+    return f'"{name}"'
+
+def show_grants_to_user_safer(conn, user_raw: str):
+    """
+    Returns (grants_rows, owner_role, error_or_none, canon_ident)
+    - grants_rows: rows from SHOW GRANTS TO USER if allowed, else []
+    - owner_role: owner from SHOW USERS if visible, else ""
+    - error_or_none: the Exception from SHOW GRANTS if it failed
+    - canon_ident: best-effort canonical Snowflake identifier for the user (quoted if needed),
+                   based on SHOW USERS scan; may be None if we couldn't find a match
+    """
+    u_input = (user_raw or "").strip().strip('"')  # normalize typing quirks
+    err = None
+    rows = []
+    owner = ""
+    canon_ident = None
+
+    # 1) Try privileged path first with a conservative identifier strategy
+    #    If the user typed UPPER + [A-Z0-9_], use unquoted; else quoted.
+    if u_input.isupper() and u_input.replace("_","").isalnum():
+        ident_try = u_input
+    else:
+        ident_try = f'"{u_input}"'
+
+    try:
+        with conn.cursor(snowflake.connector.DictCursor) as cur:
+            cur.execute(f"SHOW GRANTS TO USER {ident_try}")
+            rows = cur.fetchall()
+            return rows, owner, None, ident_try
+    except Exception as e:
+        err = e  # keep going
+
+    # 2) Fallback: scan SHOW USERS and find the exact user by name (case-insensitive)
+    #    (LIKE is prefix + case-sensitive, so we avoid it.)
+    try:
+        with conn.cursor(snowflake.connector.DictCursor) as cur:
+            cur.execute("SHOW USERS")
+            all_users = cur.fetchall()  # may be large; Snowflake caps to reasonable size
+        # Try to match ignoring case on the 'name' column
+        match = None
+        for r in all_users:
+            nm = (r.get("name") or r.get("NAME") or "")
+            if nm.lower() == u_input.lower():
+                match = r
+                break
+        if match:
+            owner = (match.get("owner") or match.get("OWNER") or "")
+            canon_ident = _canon_user_ident_from_show_row(match)
+
+            # Try again with the canonical ident (might have been a quoting/case issue)
+            try:
+                with conn.cursor(snowflake.connector.DictCursor) as cur:
+                    cur.execute(f"SHOW GRANTS TO USER {canon_ident}")
+                    rows = cur.fetchall()
+                    return rows, owner, None, canon_ident
+            except Exception as e2:
+                # still not allowed; return fallback info
+                return [], owner, e2, canon_ident
+        else:
+            # No visibility to user row or truly doesn't exist
+            return [], owner, err, None
+    except Exception:
+        # Can't list users either
+        return [], owner, err, None
+
+
 # -------------------------
 # User Access (onrole/offrole, move, restrict DBs, viewer)
 # -------------------------
@@ -1600,22 +1814,63 @@ with tab_user_access:
 
         st.divider()
 
-        st.markdown("### Effective Grants Viewer")
-        if st.button("Refresh Grants", key="ua_refresh_grants"):
-            try:
-                with get_conn() as conn:
-                    grants = show_grants_to_user(conn, user_input)
-                if grants:
-                    with st.expander("Raw SHOW GRANTS TO USER output", expanded=False):
-                        st.json(grants)
-                    db_usage = [g for g in grants if (g.get("granted_on","").upper()=="DATABASE")]
-                    role_grants = [g for g in grants if g.get("grant_type","").upper()=="ROLE_GRANT"]
-                    st.write(f"Database USAGE entries: {len(db_usage)}")
-                    st.write(f"Role grants (direct/indirect): {len(role_grants)}")
-                else:
-                    st.info("No grants visible for this user.")
-            except Exception as e:
-                st.error(f"Show grants failed: {e}")
+# --- Effective privileges viewer (SAFER) ---
+st.markdown("### Effective Grants Viewer")
+
+if st.button("Refresh Grants", key="ua_refresh_grants"):
+    u_raw = (user_input or "").strip()
+    if not u_raw:
+        st.error("Enter a user to inspect.")
+    else:
+        # Outer try to catch connection or helper failures
+        try:
+            with get_conn() as conn:
+                grants, owner_role, err, canon_ident = show_grants_to_user_safer(conn, u_raw)
+        except Exception as e:
+            st.error(f"Failed to check grants: {e}")
+        else:
+            if grants:
+                with st.expander(f"Raw SHOW GRANTS TO USER {canon_ident or u_raw}", expanded=False):
+                    st.json(grants)
+                db_usage   = [g for g in grants if (g.get("granted_on","").upper() == "DATABASE")]
+                role_grants = [g for g in grants if g.get("grant_type","").upper() == "ROLE_GRANT"]
+                st.write(f"Database USAGE entries: {len(db_usage)}")
+                st.write(f"Role grants (direct/indirect): {len(role_grants)}")
+            else:
+                msg = f"Limited visibility for **{u_raw}** — cannot run SHOW GRANTS TO USER."
+                if owner_role:
+                    msg += f" Owner: **{owner_role}**."
+                st.warning(msg)
+                if err:
+                    st.caption(f"Original error: {err}")
+
+                # Offer retry with discovered OWNER role
+                if owner_role:
+                    c1, c2 = st.columns([1,3])
+                    with c1:
+                        if st.button(f"Try with role: {owner_role}", key="ua_retry_owner"):
+                            try:
+                                with get_conn() as conn2:
+                                    set_role(conn2, owner_role)
+                                    grants2, _, err2, canon2 = show_grants_to_user_safer(conn2, u_raw)
+                            except Exception as e2:
+                                st.error(f"Retry failed: {e2}")
+                            else:
+                                if grants2:
+                                    with st.expander(f"Raw SHOW GRANTS TO USER {canon2 or u_raw}", expanded=False):
+                                        st.json(grants2)
+                                    db_usage2   = [g for g in grants2 if (g.get("granted_on","").upper() == "DATABASE")]
+                                    role_grants2 = [g for g in grants2 if g.get("grant_type","").upper() == "ROLE_GRANT"]
+                                    st.success(f"Loaded grants with role {owner_role}.")
+                                    st.write(f"Database USAGE entries: {len(db_usage2)}")
+                                    st.write(f"Role grants (direct/indirect): {len(role_grants2)}")
+                                else:
+                                    st.info("Still limited. You may need SECURITYADMIN or ACCOUNTADMIN.")
+                                    if err2:
+                                        st.caption(f"Original error: {err2}")
+                    with c2:
+                        st.caption("Tip: You can also use the **Session Role** controls above to switch roles, then click Refresh again.")
+
 
 # -------------------------
 # Preview & Execute
@@ -2394,6 +2649,38 @@ def get_user_details(conn, user: str) -> Dict[str, Any]:
             out[k] = v
     return out
 
+def get_user_details_safe(conn, user: str) -> tuple[dict, dict, Exception | None]:
+    """
+    Returns (details_from_DESC, row_from_SHOW, error_if_any).
+    If DESC USER fails (insufficient privileges), details_from_DESC is {} and error is set.
+    """
+    desc = {}
+    show_row = {}
+    err = None
+    try:
+        with conn.cursor(snowflake.connector.DictCursor) as cur:
+            # Try privileged path
+            cur.execute(f"DESC USER {sql_ident(user)}")
+            rows = cur.fetchall()  # [{property:..., value:...}, ...]
+        for r in rows:
+            k = (r.get("property") or "").upper()
+            v = r.get("value")
+            if k:
+                desc[k] = v
+    except Exception as e:
+        err = e
+        # Fallback to SHOW USERS LIKE (limited fields but includes OWNER)
+        try:
+            with conn.cursor(snowflake.connector.DictCursor) as cur:
+                cur.execute(f"SHOW USERS LIKE '{user}'")
+                rows = cur.fetchall()
+            if rows:
+                show_row = rows[0]  # has name, login_name, email, owner, created_on, etc.
+        except Exception:
+            pass
+    return desc, show_row, err
+
+
 # -------------------------
 # Users (create/update)
 # -------------------------
@@ -2437,30 +2724,78 @@ with tab_users:
                 if st.button("Load", key=f"usr_pick_{uname}"):
                     try:
                         with get_conn() as conn:
-                            d = get_user_details(conn, uname)
-                        # Pre-fill the form fields below
-                        st.session_state["usr_name"] = uname
-                        st.session_state["usr_login"] = d.get("LOGIN_NAME") or ""
-                        st.session_state["usr_display"] = d.get("DISPLAY_NAME") or ""
-                        st.session_state["usr_email"] = d.get("EMAIL") or ""
-                        st.session_state["usr_disabled"] = (str(d.get("DISABLED","")).upper() == "TRUE")
-                        st.session_state["usr_np"] = d.get("NETWORK_POLICY") or ""
-                        st.session_state["usr_def_role"] = d.get("DEFAULT_ROLE") or st.session_state.get("usr_def_role","")
-                        st.session_state["usr_def_wh"] = d.get("DEFAULT_WAREHOUSE") or st.session_state.get("usr_def_wh","")
-                        # DEFAULT_NAMESPACE -> DB.SCHEMA
-                        ns = (d.get("DEFAULT_NAMESPACE") or "")
-                        if "." in ns:
-                            dbp, scp = ns.split(".", 1)
-                            st.session_state["usr_def_db"] = dbp.strip('"')
-                            st.session_state["usr_def_schema"] = scp.strip('"')
+                            d_full, d_show, err = get_user_details_safe(conn, uname)
+
+                        if d_full:
+                            # Privileged path: DESC USER worked
+                            st.success(f"Loaded details for {uname} below ⤵")
+                            st.session_state["usr_name"]        = uname
+                            st.session_state["usr_login"]       = d_full.get("LOGIN_NAME") or ""
+                            st.session_state["usr_display"]     = d_full.get("DISPLAY_NAME") or ""
+                            st.session_state["usr_email"]       = d_full.get("EMAIL") or ""
+                            st.session_state["usr_disabled"]    = (str(d_full.get("DISABLED","")).upper() == "TRUE")
+                            st.session_state["usr_np"]          = d_full.get("NETWORK_POLICY") or ""
+                            st.session_state["usr_def_role"]    = d_full.get("DEFAULT_ROLE") or st.session_state.get("usr_def_role","")
+                            st.session_state["usr_def_wh"]      = d_full.get("DEFAULT_WAREHOUSE") or st.session_state.get("usr_def_wh","")
+                            ns = (d_full.get("DEFAULT_NAMESPACE") or "")
+                            if "." in ns:
+                                dbp, scp = ns.split(".", 1)
+                                st.session_state["usr_def_db"] = dbp.strip('"')
+                                st.session_state["usr_def_schema"] = scp.strip('"')
+                            else:
+                                st.session_state["usr_def_db"] = st.session_state.get("usr_def_db","")
+                                st.session_state["usr_def_schema"] = st.session_state.get("usr_def_schema","")
+
                         else:
-                            st.session_state["usr_def_db"] = st.session_state.get("usr_def_db","")
-                            st.session_state["usr_def_schema"] = st.session_state.get("usr_def_schema","")
-                        st.success(f"Loaded details for {uname} below ⤵")
+                            # Limited path: fallback to SHOW USERS row (owner visible)
+                            owner_show = (d_show.get("owner") or d_show.get("OWNER") or owner or "UNKNOWN")
+                            st.warning(
+                                f"Limited visibility for **{uname}** (no DESC USER). "
+                                f"Owner appears to be **{owner_show}**. Switch to that role or SECURITYADMIN for full details."
+                            )
+                            # Prefill whatever we can from SHOW USERS
+                            st.session_state["usr_name"]     = uname
+                            st.session_state["usr_login"]    = (d_show.get("login_name") or d_show.get("LOGIN_NAME") or "")
+                            st.session_state["usr_display"]  = (d_show.get("display_name") or d_show.get("DISPLAY_NAME") or "")
+                            st.session_state["usr_email"]    = (d_show.get("email") or d_show.get("EMAIL") or "")
+                            # Unknown via SHOW:
+                            st.session_state["usr_disabled"] = st.session_state.get("usr_disabled", False)
+                            st.session_state["usr_np"]       = st.session_state.get("usr_np", "")
+
+                            # Quick retry button with owner role (if visible)
+                            if owner_show and owner_show not in ("UNKNOWN", ""):
+                                if st.button(f"Try with role: {owner_show}", key=f"usr_retry_{uname}"):
+                                    try:
+                                        with get_conn() as conn2:
+                                            set_role(conn2, owner_show)
+                                            d_full2, _, err2 = get_user_details_safe(conn2, uname)
+                                        if d_full2:
+                                            st.success(f"Loaded with role {owner_show}.")
+                                            st.session_state["usr_login"]       = d_full2.get("LOGIN_NAME") or ""
+                                            st.session_state["usr_display"]     = d_full2.get("DISPLAY_NAME") or ""
+                                            st.session_state["usr_email"]       = d_full2.get("EMAIL") or ""
+                                            st.session_state["usr_disabled"]    = (str(d_full2.get("DISABLED","")).upper() == "TRUE")
+                                            st.session_state["usr_np"]          = d_full2.get("NETWORK_POLICY") or ""
+                                            st.session_state["usr_def_role"]    = d_full2.get("DEFAULT_ROLE") or st.session_state.get("usr_def_role","")
+                                            st.session_state["usr_def_wh"]      = d_full2.get("DEFAULT_WAREHOUSE") or st.session_state.get("usr_def_wh","")
+                                            ns2 = (d_full2.get("DEFAULT_NAMESPACE") or "")
+                                            if "." in ns2:
+                                                dbp2, scp2 = ns2.split(".", 1)
+                                                st.session_state["usr_def_db"] = dbp2.strip('"')
+                                                st.session_state["usr_def_schema"] = scp2.strip('"')
+                                        else:
+                                            st.info("Still limited. You may need SECURITYADMIN or actual ownership.")
+                                            if err2:
+                                                st.caption(f"Original error: {err2}")
+                                    except Exception as e2:
+                                        st.error(f"Retry failed: {e2}")
+
+                        if err and not d_full:
+                            st.caption(f"Original error: {err}")
+
                     except Exception as e:
                         st.error(f"Failed to load user details: {e}")
-    else:
-        st.info("No users listed yet. Click **Refresh list** (requires SECURITYADMIN or ACCOUNTADMIN).")
+
 
     st.divider()
 
@@ -2529,6 +2864,7 @@ with tab_users:
     grant_schema_usage = st.checkbox("Also grant USAGE on ALL current & FUTURE schemas for the allowed DBs", value=True, key="usr_schema_usage")
 
     # Action
+    st.caption("Note: Creating/updating users typically requires SECURITYADMIN (or ownership of the target user).")
     do_create = st.button("Create / Update User", type="primary", key="usr_do")
     if do_create:
         if not user_name:
